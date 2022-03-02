@@ -5,7 +5,6 @@ module Agda.Interaction.Base where
 
 import           Control.Concurrent.STM.TChan
 import           Control.Concurrent.STM.TVar
-
 import           Control.Monad                ( mplus, liftM2, liftM4 )
 import           Control.Monad.Except
 import           Control.Monad.Identity
@@ -161,6 +160,9 @@ data Interaction' range
     -- | Solve (all goals / the goal at point) by using Auto.
   | Cmd_autoOne            InteractionId range String
   | Cmd_autoAll
+
+    -- | TODO
+  | Cmd_mimer InteractionId range String
 
     -- | Parse the given expression (as if it were defined at the
     -- top-level of the current module) and infer its type.

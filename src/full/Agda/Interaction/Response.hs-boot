@@ -23,6 +23,7 @@ data Response
     | Resp_GiveAction InteractionId GiveResult
     | Resp_MakeCase InteractionId MakeCaseVariant [String]
     | Resp_SolveAll [(InteractionId, Expr)]
+    | Resp_Mimer InteractionId String
     | Resp_DisplayInfo DisplayInfo
     | Resp_RunningInfo Int String
     | Resp_ClearRunningInfo

@@ -64,6 +64,7 @@ data Response
       -- ^ Response is list of printed clauses.
     | Resp_SolveAll [(InteractionId, Expr)]
       -- ^ Solution for one or more meta-variables.
+    | Resp_Mimer InteractionId String
     | Resp_DisplayInfo DisplayInfo
     | Resp_RunningInfo Int String
       -- ^ The integer is the message's debug level.
@@ -209,6 +210,7 @@ defaultInteractionOutputCallback = \case
   Resp_GiveAction {}        -> __IMPOSSIBLE__
   Resp_MakeCase {}          -> __IMPOSSIBLE__
   Resp_SolveAll {}          -> __IMPOSSIBLE__
+  Resp_Mimer {}             -> __IMPOSSIBLE__
   Resp_DisplayInfo {}       -> __IMPOSSIBLE__
   Resp_RunningInfo _ s      -> liftIO $ do
                                  putStr s

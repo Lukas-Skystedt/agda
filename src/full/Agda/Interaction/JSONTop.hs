@@ -1,7 +1,6 @@
 module Agda.Interaction.JSONTop
     ( jsonREPL
     ) where
-
 import Control.Monad          ( (<=<), forM )
 import Control.Monad.IO.Class ( MonadIO(..) )
 
@@ -268,6 +267,7 @@ instance EncodeTCM DisplayInfo where
     ]
   encodeTCM (Info_Constraints constraints) = kind "Constraints"
     [ "constraints"       #= forM constraints encodeTCM
+
     ]
   encodeTCM (Info_AllGoalsWarnings (vis, invis) wes) = kind "AllGoalsWarnings"
     [ "visibleGoals"      #= forM vis (\i -> withInteractionId (B.outputFormId $ OutputForm noRange [] alwaysUnblock i) $ encodeOC encodeTCM encodePrettyTCM i)
@@ -435,6 +435,9 @@ instance EncodeTCM Response where
         [ "interactionPoint"  .= i
         , "expression"        .= P.prettyShow expr
         ]
+  encodeTCM (Resp_Mimer ii str) = kind "Mimer"
+    [ "solution" @= str
+    ]
 
 -- | Convert Response to an JSON value for interactive editor frontends.
 jsonifyResponse :: Response -> TCM ByteString

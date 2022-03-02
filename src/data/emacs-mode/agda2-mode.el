@@ -238,6 +238,7 @@ constituents.")
     (agda2-elaborate-give                    ,(kbd "C-c C-m")     (local)        "Elaborate and Give")
     (agda2-refine                            "\C-c\C-r"           (local)        "Refine")
     (agda2-auto-maybe-all                    "\C-c\C-a"           (local global) "Auto")
+    (agda2-mimer                             "\C-c\C-m"           (local)        "Mimer")
     (agda2-make-case                         "\C-c\C-c"           (local)        "Case")
     (agda2-goal-type                         "\C-c\C-t"           (local)        "Goal type")
     (agda2-show-context                      "\C-c\C-e"           (local)        "Context (environment)")
@@ -1390,6 +1391,11 @@ Either only one if point is a goal, or all of them."
                           'agda2-autoOne
                           'agda2-autoAll))
 )
+
+(defun agda2-mimer ()
+  "Run Mimer."
+  (interactive)
+  (agda2-goal-cmd "Cmd_mimer" 'save 'goal))
 
 (agda2-maybe-normalised-toplevel-asis-noprompt
  agda2-show-goals

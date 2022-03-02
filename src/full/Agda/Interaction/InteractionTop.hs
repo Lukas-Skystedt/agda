@@ -13,7 +13,6 @@ import Control.Concurrent
 import Control.Concurrent.Async
 import Control.Concurrent.STM.TChan
 import Control.Concurrent.STM.TVar
-
 import qualified Control.Exception  as E
 
 import Control.Monad
@@ -23,6 +22,7 @@ import Control.Monad.Fail           ( MonadFail )
 import Control.Monad.State          ( MonadState(..), gets, modify, runStateT )
 import Control.Monad.STM
 import Control.Monad.Trans          ( lift )
+
 
 import qualified Data.Char as Char
 import Data.Function
@@ -71,6 +71,7 @@ import Agda.Interaction.Highlighting.Generate
 import Agda.Compiler.Backend
 
 import Agda.Auto.Auto as Auto
+import Agda.Mimer.Mimer as Mimer
 
 import Agda.Utils.Either
 import Agda.Utils.FileName
@@ -475,6 +476,7 @@ updateInteractionPointsAfter Cmd_intro{}                         = True
 updateInteractionPointsAfter Cmd_refine_or_intro{}               = True
 updateInteractionPointsAfter Cmd_autoOne{}                       = True
 updateInteractionPointsAfter Cmd_autoAll{}                       = True
+updateInteractionPointsAfter Cmd_mimer{}                         = True
 updateInteractionPointsAfter Cmd_context{}                       = False
 updateInteractionPointsAfter Cmd_helper_function{}               = False
 updateInteractionPointsAfter Cmd_infer{}                         = False
@@ -727,6 +729,10 @@ interpret Cmd_autoAll = do
             return jj
         _ -> return []
     modifyTheInteractionPoints (List.\\ concat solved)
+
+interpret (Cmd_mimer ii range str) = do
+  Mimer.MimerResult result <- Mimer.mimer ii range str
+  putResponse $ Resp_Mimer ii result
 
 interpret (Cmd_context norm ii _ _) =
   display_info . Info_Context ii =<< liftLocalState (B.getResponseContext norm ii)
