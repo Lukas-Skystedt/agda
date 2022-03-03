@@ -11,6 +11,7 @@ import qualified Data.Map as Map
 import Data.List (sortOn, isSuffixOf, intercalate)
 import Data.Maybe (isJust)
 import Data.Function (on)
+import qualified Data.IntSet as IntSet
 
 import Agda.Auto.Convert (findClauseDeep)
 import Agda.Compiler.Backend (getMetaContextArgs, TCState(..), PostScopeState(..), Open(..), isOpenMeta, getContextTerms)
@@ -20,7 +21,7 @@ import Agda.Interaction.BasicOps (typeOfMetaMI, contextOfMeta )
 import Agda.Interaction.Response (ResponseContextEntry(..))
 import Agda.Syntax.Abstract (Expr)
 import Agda.Syntax.Abstract.Name (QName(..))
-import Agda.Syntax.Common (InteractionId, MetaId, Arg(..), ArgInfo(..), defaultArgInfo, Origin(..),Induction(..), ConOrigin(..), Hiding(..), setOrigin)
+import Agda.Syntax.Common (InteractionId, MetaId(..), Arg(..), ArgInfo(..), defaultArgInfo, Origin(..),Induction(..), ConOrigin(..), Hiding(..), setOrigin)
 import Agda.Syntax.Internal (MetaId, Type, Type''(..), Term(..), Dom'(..), Abs(..), Elim, Elim'(..), arity
                             , ConHead(..), DataOrRecord(..), Args, argFromDom, Level'(..), PlusLevel'(..))
 import Agda.Syntax.Position (Range)
@@ -30,6 +31,7 @@ import Agda.TypeChecking.Constraints (noConstraints)
 import Agda.TypeChecking.Conversion (equalType)
 import Agda.TypeChecking.Datatypes (isDataOrRecordType)
 import Agda.TypeChecking.MetaVars (checkSubtypeIsEqual, newValueMeta)
+import Agda.TypeChecking.Monad.MetaVars (LocalMetaStores(..))
 import Agda.TypeChecking.Monad -- (MonadTCM, lookupInteractionId, getConstInfo, liftTCM, clScope, getMetaInfo, lookupMeta, MetaVariable(..), metaType, typeOfConst, getMetaType, MetaInfo(..), getMetaTypeInContext)
 import Agda.TypeChecking.Monad.Base (TCM)
 import Agda.TypeChecking.Pretty (prettyTCM, PrettyTCM(..))
@@ -79,7 +81,7 @@ mimer ii range hint = liftTCM $ do
     return $ MimerResult $ s
 
 
--- ###################################################################### 
+-- ######################################################################
 -- Next up: fix metas instantiated by unification. It is likely the cause of the
 -- error in constant-data-with-Order
 
@@ -174,16 +176,16 @@ dfs hints depth metaId = do
   case mvInstantiation metaVar of
     InstV inst -> do
       mlog $ "dfs: meta " ++ prettyShow metaId ++ " already instantiated to " ++ prettyShow (instBody inst)
-
+      return $ Just $ instBody inst
       -- TODO: Sometimes unification generates new metas that we need to solve. What is a good way of finding them?
-      openMetas <- getOpenMetas
-      -- openMetas <- openMetasInTerm (instBody inst)
-      case openMetas of
-        -- No unsolved sub-metas
-        [] -> return $ Just $ instBody inst
-        (metaId':_) -> dfs hints depth metaId' >>= \case
-          Nothing -> return Nothing
-          Just{} -> dfs hints depth metaId
+      -- openMetas <- getOpenMetas
+      -- -- openMetas <- openMetasInTerm (instBody inst)
+      -- case openMetas of
+      --   -- No unsolved sub-metas
+      --   [] -> return $ Just $ instBody inst
+      --   (metaId':_) -> dfs hints depth metaId' >>= \case
+      --     Nothing -> return Nothing
+      --     Just{} -> dfs hints depth metaId
     -- Meta not instantiated, check if max depth is reached
     _ | depth <= 0 -> return Nothing
       -- Max depth not reached, continue search
@@ -234,16 +236,23 @@ tryRefine hints depth metaId hintTerm hintTyp = do
       typ <- reduce nonreducedTyp
       mlog $ "Trying " ++ prettyShow term ++ " : " ++ prettyShow typ ++ " to solve meta of type " ++ prettyShow metaType
       oldState <- getTC -- TODO: Backtracking state
-      dumbUnifier typ metaType >>= \case
+      metasCreatedBy (dumbUnifier typ metaType) >>= \case
         -- The hint is applicable
-        True -> do
-          mlog $ "unifier succeeded. Assigning " ++ prettyShow term ++ " to " ++ prettyShow metaId
-          assignV DirLeq metaId metaArgs term (AsTermsOf metaType)
-          return $ Just term
-        False -> case unEl typ of
+        (True, newMetaStore) -> do
+          let newMetaIds = Map.keys (openMetas newMetaStore)
+          mlog $ "unifier succeeded, creating new metas: " ++ prettyShow newMetaIds ++ ".  Assigning " ++ prettyShow term ++ " to " ++ prettyShow metaId
+          -- Solve any
+          sequence <$> mapM (dfs hints (depth - 1)) newMetaIds >>= \case
+            Just terms -> do
+              assignV DirLeq metaId metaArgs term (AsTermsOf metaType)
+              return $ Just term
+            Nothing -> do
+              putTC oldState
+              return Nothing
+        (False, _) -> case unEl typ of
           -- The hint may be applicable if we apply it to more metas
           Pi dom abs -> do
-              putTC oldState -- TODO: Is this needed? (Reset the state in case dumbUnifier left some constraints.)
+              putTC oldState
               let domainType = unDom dom
               -- TODO: What exactly does the occur check do?
               (metaId', metaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq domainType
