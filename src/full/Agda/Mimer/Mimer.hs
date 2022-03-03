@@ -5,7 +5,7 @@ module Agda.Mimer.Mimer
   where
 
 import Data.Maybe (maybeToList)
-import Control.Monad (forM, zipWithM, (>=>))
+import Control.Monad (forM, zipWithM, (>=>), filterM)
 import Control.Monad.Except (catchError)
 import qualified Data.Map as Map
 import Data.List (sortOn, isSuffixOf, intercalate)
@@ -13,15 +13,18 @@ import Data.Maybe (isJust)
 import Data.Function (on)
 
 import Agda.Auto.Convert (findClauseDeep)
-import Agda.Compiler.Backend (getMetaContextArgs, TCState(..), PostScopeState(..), Open(..))
+import Agda.Compiler.Backend (getMetaContextArgs, TCState(..), PostScopeState(..), Open(..), isOpenMeta, getContextTerms)
 import Agda.Interaction.Base
 import Agda.Interaction.Base (Rewrite(..))
 import Agda.Interaction.BasicOps (typeOfMetaMI, contextOfMeta )
 import Agda.Interaction.Response (ResponseContextEntry(..))
+import Agda.Syntax.Abstract (Expr)
 import Agda.Syntax.Abstract.Name (QName(..))
 import Agda.Syntax.Common (InteractionId, MetaId, Arg(..), ArgInfo(..), defaultArgInfo, Origin(..),Induction(..), ConOrigin(..), Hiding(..), setOrigin)
-import Agda.Syntax.Internal (MetaId, Type, Type''(..), Term(..), Dom'(..), Abs(..), Elim, Elim'(..), arity, ConHead(..), DataOrRecord(..), Args, argFromDom)
+import Agda.Syntax.Internal (MetaId, Type, Type''(..), Term(..), Dom'(..), Abs(..), Elim, Elim'(..), arity
+                            , ConHead(..), DataOrRecord(..), Args, argFromDom, Level'(..), PlusLevel'(..))
 import Agda.Syntax.Position (Range)
+import Agda.Syntax.Translation.InternalToAbstract (reify)
 import Agda.TypeChecking.CheckInternal (infer)
 import Agda.TypeChecking.Constraints (noConstraints)
 import Agda.TypeChecking.Conversion (equalType)
@@ -33,7 +36,7 @@ import Agda.TypeChecking.Pretty (prettyTCM, PrettyTCM(..))
 import Agda.TypeChecking.Reduce (normalise, reduce)
 import Agda.TypeChecking.Substitute (piApply, raise)
 import Agda.TypeChecking.Substitute.Class (apply)
-import Agda.TypeChecking.Telescope (piApplyM)
+import Agda.TypeChecking.Telescope (piApplyM, flattenTel)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Maybe (catMaybes)
 import Agda.Utils.Permutation (idP)
@@ -67,7 +70,7 @@ mimer ii range hint = liftTCM $ do
     -- The meta variable to solve
     -- metaI <- lookupInteractionId ii
     s <- runDfs ii >>= \case
-      Just term -> showTCM term
+      Just expr -> showTCM $ expr
       Nothing -> return ""
 
     openMetas <- getOpenMetas
@@ -76,7 +79,12 @@ mimer ii range hint = liftTCM $ do
     return $ MimerResult $ s
 
 
--- Order to try things in:
+-- ###################################################################### 
+-- Next up: fix metas instantiated by unification. It is likely the cause of the
+-- error in constant-data-with-Order
+
+
+-- arg to try things in:
 -- 1. Local variables (including let-bound)
 -- 2. Data constructors
 -- 3. Where clauses
@@ -100,7 +108,7 @@ data Components = Component
 
 
 -- TODO: withInteractionId to get the right context
-runDfs :: InteractionId -> TCM (Maybe Term)
+runDfs :: InteractionId -> TCM (Maybe Expr)
 runDfs ii = withInteractionId ii $ do
   -- TODO: What normalization should we use here?
   -- TODO: The problem with `contextOfMeta` is that it gives `Expr`. However, it does include let-bindings.
@@ -110,6 +118,9 @@ runDfs ii = withInteractionId ii $ do
 
   context' <- getContext
   mlog $ "getContext: " ++ prettyShow context'
+
+  localVars <- getLocalVars
+  mlog $ "getLocalVars: " ++ prettyShow localVars
 
   letVars <- Map.toAscList <$> asksTC envLetBindings
   mlog $ "let-bound vars: " ++ prettyShow letVars
@@ -132,8 +143,9 @@ runDfs ii = withInteractionId ii $ do
   metaVar' <- lookupLocalMeta metaId
   case mvInstantiation metaVar' of
     InstV inst -> do
-      mlog $ "instantiated to: " ++ prettyShow (instTel inst) ++ " " ++ prettyShow (instBody inst)
-      return $ Just (instBody inst)
+      termStr <- showTCM (instBody inst)
+      mlog $ "instantiated to (showTCM):  " ++ termStr
+      Just <$> reify (instBody inst)
     _ -> return Nothing
 
 qnameToTerm :: QName -> TCM (Maybe (Term, Type))
@@ -153,8 +165,8 @@ qnameToTerm qname = do
   return ((,typ) <$> mTerm)
 
 
+
 -- TODO: Check how giveExpr (intercation basic ops) -- v' <- instantiate $ MetaV mi $ map Apply ctx
--- TODO: Check if meta is already instantiated
 dfs :: [(Term, Type)] -> Int -> MetaId -> TCM (Maybe Term)
 dfs hints depth metaId = do
   metaVar <- lookupLocalMeta metaId
@@ -165,6 +177,7 @@ dfs hints depth metaId = do
 
       -- TODO: Sometimes unification generates new metas that we need to solve. What is a good way of finding them?
       openMetas <- getOpenMetas
+      -- openMetas <- openMetasInTerm (instBody inst)
       case openMetas of
         -- No unsolved sub-metas
         [] -> return $ Just $ instBody inst
@@ -175,9 +188,10 @@ dfs hints depth metaId = do
     _ | depth <= 0 -> return Nothing
       -- Max depth not reached, continue search
       | otherwise -> do
-          localVars <- getContext
-          --go localVars `elseTry`
-          tryDataCon hints depth metaId `elseTry` go hints
+          localVars <- getLocalVars
+          go localVars
+            `elseTry` tryDataCon hints depth metaId
+            `elseTry` go hints
   where
     go [] = return Nothing
     go ((hintTerm, hintType):hs) = do
@@ -372,3 +386,45 @@ elseTry :: Monad m => m (Maybe a) -> m (Maybe a) -> m (Maybe a)
 elseTry ma ma1 = ma >>= \case
   Nothing -> ma1
   a@Just{} -> return a
+
+
+metasInTerm :: Term -> [MetaId]
+metasInTerm = \case
+  Var _ es -> concatMap metasInElim es
+  Lam _ abs -> metasInTerm $ unAbs abs
+  Lit{} -> []
+  Def _ es -> concatMap metasInElim es
+  Con _ _ es -> concatMap metasInElim es
+  Pi dom abs -> metasInType (unDom dom) ++ metasInType (unAbs abs)
+  Sort{} -> []
+  Level (Max _ pls) -> concatMap (\(Plus _ t) -> metasInTerm t) pls
+  MetaV metaId es -> metaId : concatMap metasInElim es
+  -- TODO: What are don't care and dummy term?
+  DontCare _t -> []
+  Dummy _ _es -> []
+
+metasInType :: Type -> [MetaId]
+metasInType = metasInTerm . unEl
+
+metasInElim :: Elim -> [MetaId]
+metasInElim = \case
+  Apply arg -> metasInTerm $ unArg arg
+  Proj{} -> []
+  IApply t1 t2 t3 -> metasInTerm t1 ++ metasInTerm t2 ++ metasInTerm t3
+
+isMetaIdOpen :: (MonadDebug m, ReadTCState m) => MetaId -> m Bool
+isMetaIdOpen metaId = isOpenMeta . mvInstantiation <$> lookupLocalMeta metaId
+
+openMetasInTerm :: Term -> TCM [MetaId]
+openMetasInTerm = filterM isMetaIdOpen . metasInTerm
+
+-- Local variables:
+-- getContext :: MonadTCEnv m => m [Dom (Name, Type)]
+-- getContextArgs :: (Applicative m, MonadTCEnv m) => m Args
+-- getContextTelescope :: (Applicative m, MonadTCEnv m) => m Telescope
+-- getContextTerms :: (Applicative m, MonadTCEnv m) => m [Term]
+getLocalVars :: TCM [(Term, Type)]
+getLocalVars = do
+  contextTerms <- getContextTerms
+  contextTypes <- map unDom . flattenTel <$> getContextTelescope
+  return $ zip contextTerms contextTypes
