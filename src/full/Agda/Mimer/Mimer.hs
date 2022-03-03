@@ -75,6 +75,7 @@ mimer ii range hint = liftTCM $ do
       Just expr -> showTCM $ expr
       Nothing -> return ""
 
+
     openMetas <- getOpenMetas
     mlog $ "Remaining open metas: " ++ prettyShow openMetas
     putTC oldState
@@ -112,6 +113,8 @@ data Components = Component
 -- TODO: withInteractionId to get the right context
 runDfs :: InteractionId -> TCM (Maybe Expr)
 runDfs ii = withInteractionId ii $ do
+  theFunctionQName <- ipcQName . ipClause <$> lookupInteractionPoint ii
+  mlog $ "Interaction point inside: " ++ prettyShow theFunctionQName
   -- TODO: What normalization should we use here?
   -- TODO: The problem with `contextOfMeta` is that it gives `Expr`. However, it does include let-bindings.
   context <- contextOfMeta ii AsIs
@@ -134,7 +137,9 @@ runDfs ii = withInteractionId ii $ do
   mlog $ "getMetaContextArgs: " ++ prettyShow metaArgs
 
 
-  hintNames <- filter (not . ("test" `isSuffixOf`) . prettyShow) . map hintName <$> getEverythingInScope metaVar
+  -- We remove the name of the function the interaction point occurs in to prevent
+  -- arbitrary recursive calls
+  hintNames <- filter (/= theFunctionQName) . map hintName <$> getEverythingInScope metaVar
   hints <- sortOn (arity . snd) . catMaybes <$> mapM qnameToTerm hintNames
   let hints' = filter (\(d,_) -> case d of Def{} -> True; _ -> False) hints
   mlog $ "Using hints: " ++ prettyShow (map fst hints')
