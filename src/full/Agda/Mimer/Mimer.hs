@@ -5,7 +5,7 @@ module Agda.Mimer.Mimer
   where
 
 import Data.Maybe (maybeToList)
-import Control.Monad (forM, zipWithM, (>=>), filterM)
+import Control.Monad (forM, zipWithM, (>=>), filterM, (<=<))
 import Control.Monad.Except (catchError)
 import qualified Data.Map as Map
 import Data.List (sortOn, isSuffixOf, intercalate)
@@ -35,6 +35,7 @@ import Agda.TypeChecking.Monad.MetaVars (LocalMetaStores(..))
 import Agda.TypeChecking.Monad -- (MonadTCM, lookupInteractionId, getConstInfo, liftTCM, clScope, getMetaInfo, lookupMeta, MetaVariable(..), metaType, typeOfConst, getMetaType, MetaInfo(..), getMetaTypeInContext)
 import Agda.TypeChecking.Monad.Base (TCM)
 import Agda.TypeChecking.Pretty (prettyTCM, PrettyTCM(..))
+import Agda.TypeChecking.Records (isRecord, getRecordFieldNames)
 import Agda.TypeChecking.Reduce (normalise, reduce)
 import Agda.TypeChecking.Substitute (piApply, raise)
 import Agda.TypeChecking.Substitute.Class (apply)
@@ -139,7 +140,10 @@ runDfs ii = withInteractionId ii $ do
 
   -- We remove the name of the function the interaction point occurs in to prevent
   -- arbitrary recursive calls
-  hintNames <- filter (/= theFunctionQName) . map hintName <$> getEverythingInScope metaVar
+  hintNames1 <- filter (/= theFunctionQName) . map hintName <$> getEverythingInScope metaVar
+  records <- filterM (fmap isJust . isRecord) hintNames1
+  recordProjs <- concat  <$> mapM getRecordFields records
+  let hintNames = hintNames1 ++ recordProjs
   hints <- sortOn (arity . snd) . catMaybes <$> mapM qnameToTerm hintNames
   let hints' = filter (\(d,_) -> case d of Def{} -> True; _ -> False) hints
   mlog $ "Using hints: " ++ prettyShow (map fst hints')
@@ -174,6 +178,15 @@ runDfs ii = withInteractionId ii $ do
 
       _ -> return ()
 
+getRecordFields :: QName -> TCM [QName]
+getRecordFields = fmap (map unDom . recFields . theDef) . getConstInfo
+
+  -- do
+  -- info <- getConstInfo qname
+  -- case theDef info of
+  --   r@Record{} -> mapM (qnameToTerm . unDom) (recFields r)
+  --   _ -> Nothing
+
 
 qnameToTerm :: QName -> TCM (Maybe (Term, Type))
 qnameToTerm qname = do
@@ -192,7 +205,6 @@ qnameToTerm qname = do
         PrimitiveSort{} -> Just $ Def qname [] -- TODO
 
   return ((,typ) <$> mTerm)
-
 
 
 -- TODO: Check how giveExpr (intercation basic ops) -- v' <- instantiate $ MetaV mi $ map Apply ctx
@@ -250,6 +262,7 @@ tryDataCon hints depth metaId = do
         info <- getConstInfo qname
         case theDef info of
           -- TODO: is ConORec appropriate?
+          -- TODO: There is a `getRecordConstructor` function
           recordDefn@Record{} -> do
             let cHead = recConHead recordDefn
                 cName = conName cHead
