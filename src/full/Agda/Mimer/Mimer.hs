@@ -37,6 +37,7 @@ import Agda.TypeChecking.Monad.Base (TCM)
 import Agda.TypeChecking.Pretty (prettyTCM, PrettyTCM(..))
 import Agda.TypeChecking.Records (isRecord, getRecordFieldNames)
 import Agda.TypeChecking.Reduce (normalise, reduce)
+import Agda.TypeChecking.Rules.Term (lambdaAddContext)
 import Agda.TypeChecking.Substitute (piApply, raise)
 import Agda.TypeChecking.Substitute.Class (apply)
 import Agda.TypeChecking.Telescope (piApplyM, flattenTel)
@@ -231,8 +232,9 @@ dfs hints depth metaId = do
       | otherwise -> do
           localVars <- getLocalVars
           go localVars
-            `elseTry` tryDataCon hints depth metaId
-            `elseTry` go hints
+            -- `elseTry` tryDataCon hints depth metaId
+            -- `elseTry` go hints
+            `elseTry` tryLambda hints depth metaId
   where
     go [] = return Nothing
     go ((hintTerm, hintType):hs) = do
@@ -330,6 +332,47 @@ tryRefine hints depth metaId hintTerm hintTyp = do
 -- Termination checking:
 -- Build call graph
 -- Every cycle must have a "shrinking" arg
+
+tryLambda :: [(Term, Type)] -> Int -> MetaId -> TCM (Maybe Term)
+tryLambda hints depth metaId = do
+  oldState <- getTC
+  metaVar <- lookupLocalMeta metaId
+  metaArgs <- getMetaContextArgs metaVar
+  nonReducedMetaType <- getMetaTypeInContext metaId
+  metaType <- reduce nonReducedMetaType
+  -- TODO: check out `ifPi` or `ifPiType`
+  case unEl metaType of
+    Pi dom abs -> do
+      -- TODO: look at `suggests`
+      let bindName = absName abs
+      newName <- freshName_ bindName
+      mlog $ "Trying lambda with bindName " ++ prettyShow newName ++ " (generated from absName " ++ prettyShow (absName abs) ++ ")"
+      -- TODO: `lambdaAddContext` vs `addContext`
+      mSub <- lambdaAddContext newName bindName dom $ do
+        context <- getContext
+        mlog $ "  context inside lambda: " ++ prettyShow context
+
+        -- TODO: due to problem with shifting indices, we lookup the type of the meta again in the extended context
+        metaType' <- getMetaTypeInContext metaId
+        bodyTyp <- piApplyM metaType' (Var 0 [])
+        mlog $ "  body type inside lambda: " ++ prettyShow bodyTyp
+        (metaId', metaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq bodyTyp
+        dfs hints (depth - 1) metaId'
+      case mSub of
+        Just body -> do
+          let argInf = domInfo dom -- TODO: is this the correct arg info?
+              newAbs = Abs{absName = bindName, unAbs = body}
+              term = (Lam argInf newAbs)
+          mlog $ "Lambda succeeded. Assigning " ++ prettyShow term ++ " to " ++ prettyShow metaId
+          assignV DirLeq metaId metaArgs term (AsTermsOf metaType)
+          return $ Just term
+        Nothing -> do
+          mlog "Lambda failed."
+          putTC oldState
+          return Nothing
+    _ -> do
+      putTC oldState
+      return Nothing
 
 experiment :: MetaId -> TCM (Maybe Term)
 experiment metaId = lookupMeta metaId >>= \case
