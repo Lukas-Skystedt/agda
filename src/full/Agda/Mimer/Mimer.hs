@@ -152,22 +152,44 @@ runDfs ii = withInteractionId ii $ do
     InstV inst -> do
       termStr <- showTCM (instBody inst)
       mlog $ "instantiated to (showTCM):  " ++ termStr
+      termStrNorm <- showTCM =<< normalise (instBody inst)
+      mlog $ "instantiated (nf):  " ++ termStrNorm
+      debugRecord (instBody inst)
       Just <$> reify (instBody inst)
     _ -> return Nothing
+  where
+    debugRecord = \case
+      Con ch ci es -> do
+        mlog $ "instantiation is a con: " ++ prettyShow ch ++ " " ++ show ci ++ " " ++ prettyShow es
+        let s e = case e of
+                    Apply arg -> case unArg arg of
+                      MetaV m _ -> do
+                        mv <- lookupLocalMeta m
+                        case mvInstantiation mv of
+                          InstV inst' -> ((prettyShow m ++ "=") ++) <$> showTCM (instBody inst')
+                          _ -> return ""
+                      _ -> return ""
+                    _ -> return ""
+        mapM s es >>= \str -> mlog $ "  where " ++ unwords str
+
+      _ -> return ()
+
 
 qnameToTerm :: QName -> TCM (Maybe (Term, Type))
 qnameToTerm qname = do
   info <- getConstInfo qname
   typ <- typeOfConst qname
   let mTerm = case theDef info of
+        Axiom{} -> Just $ Def qname []
+        DataOrRecSig{} -> Nothing -- TODO
+        GeneralizableVar -> Just $ Def qname []
+        AbstractDefn{} -> Nothing -- TODO
         Function{} -> Just $ Def qname []
         Datatype{} -> Just $ Def qname []
-        Constructor{} -> Just $ Con ConHead{ conName = qname
-                                    , conDataRecord = IsData
-                                    , conInductive = Inductive
-                                    , conFields = []}
-                            ConOCon []
-        _ -> Nothing
+        Record{} -> Just $ Def qname []
+        c@Constructor{} -> Just $ Con (conSrcCon c) ConOCon []
+        Primitive{} -> Just $ Def qname [] -- TODO
+        PrimitiveSort{} -> Just $ Def qname [] -- TODO
 
   return ((,typ) <$> mTerm)
 
@@ -222,6 +244,18 @@ tryDataCon hints depth metaId = do
               let go [] = return Nothing
                   go ((term,typ):cs') = tryRefine hints depth metaId term typ `elseTry` go cs'
               in go (sortOn (arity . snd) cs) -- Try the constructors with few arguments first
+          _ -> return Nothing
+      -- TODO: pattern/copattern
+      Just IsRecord{} -> do
+        info <- getConstInfo qname
+        case theDef info of
+          -- TODO: is ConORec appropriate?
+          recordDefn@Record{} -> do
+            let cHead = recConHead recordDefn
+                cName = conName cHead
+                hintTerm = Con cHead ConORec []
+            typ <- typeOfConst cName
+            tryRefine hints depth metaId hintTerm typ
           _ -> return Nothing
       _ -> return Nothing
     _ -> return Nothing
