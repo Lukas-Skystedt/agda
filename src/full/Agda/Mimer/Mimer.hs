@@ -45,6 +45,7 @@ import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Maybe (catMaybes)
 import Agda.Utils.Permutation (idP)
 import Agda.Utils.Pretty (prettyShow, render)
+import Agda.Utils.Tuple (mapSnd)
 import qualified Agda.Syntax.Scope.Base as Scope
 import qualified Agda.TypeChecking.Monad.Base as TCM
 
@@ -84,12 +85,7 @@ mimer ii range hint = liftTCM $ do
     return $ MimerResult $ s
 
 
--- ######################################################################
--- Next up: fix metas instantiated by unification. It is likely the cause of the
--- error in constant-data-with-Order
-
-
--- arg to try things in:
+-- Order to try things in:
 -- 1. Local variables (including let-bound)
 -- 2. Data constructors
 -- 3. Where clauses
@@ -129,7 +125,10 @@ runDfs ii = withInteractionId ii $ do
   localVars <- getLocalVars
   mlog $ "getLocalVars: " ++ prettyShow localVars
 
-  letVars <- Map.toAscList <$> asksTC envLetBindings
+  -- TODO: Handle the `Open` stuff
+  -- letVars <- map (mapSnd unDom . openThing . snd) . Map.toAscList <$> asksTC envLetBindings
+  letVars <- asksTC envLetBindings >>= mapM (fmap (mapSnd unDom) . getOpen . snd) . Map.toAscList
+  -- letVars <- map (mapSnd unDom) <$> (getOpen =<< map snd . Map.toAscList <$> asksTC envLetBindings)
   mlog $ "let-bound vars: " ++ prettyShow letVars
 
 
@@ -148,7 +147,8 @@ runDfs ii = withInteractionId ii $ do
   hints <- sortOn (arity . snd) . catMaybes <$> mapM qnameToTerm hintNames
   let hints' = filter (\(d,_) -> case d of Def{} -> True; _ -> False) hints
   mlog $ "Using hints: " ++ prettyShow (map fst hints')
-  resTerm <- dfs hints' 5 metaId
+  -- TODO: Remove @letVars ++@
+  resTerm <- dfs (letVars ++ hints') 4 metaId
 
   mlog $ "dfs result term: " ++ prettyShow resTerm
 
@@ -232,8 +232,8 @@ dfs hints depth metaId = do
       | otherwise -> do
           localVars <- getLocalVars
           go localVars
-            -- `elseTry` tryDataCon hints depth metaId
-            -- `elseTry` go hints
+            `elseTry` tryDataCon hints depth metaId
+            `elseTry` go hints
             `elseTry` tryLambda hints depth metaId
   where
     go [] = return Nothing
