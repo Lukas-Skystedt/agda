@@ -5,7 +5,8 @@ module Agda.Mimer.Mimer
   where
 
 import Data.Maybe (maybeToList, fromMaybe, maybe)
-import Control.Monad (forM, zipWithM, (>=>), filterM, (<=<), unless)
+import Data.Functor ((<&>))
+import Control.Monad (forM, zipWithM, (>=>), filterM, (<=<), unless, foldM)
 import Control.Monad.Except (catchError)
 import Control.Monad.State (StateT, gets)
 import qualified Data.Map as Map
@@ -20,11 +21,12 @@ import Agda.Interaction.Base
 import Agda.Interaction.Base (Rewrite(..))
 import Agda.Interaction.BasicOps (typeOfMetaMI, contextOfMeta )
 import Agda.Interaction.Response (ResponseContextEntry(..))
-import Agda.Syntax.Abstract (Expr)
+import Agda.Syntax.Abstract (Expr(AbsurdLam))
+import Agda.Syntax.Info (exprNoRange)
 import Agda.Syntax.Abstract.Name (QName(..))
 import Agda.Syntax.Common (InteractionId, MetaId(..), Arg(..), ArgInfo(..), defaultArgInfo, Origin(..),Induction(..), ConOrigin(..), Hiding(..), setOrigin)
 import Agda.Syntax.Internal (MetaId, Type, Type''(..), Term(..), Dom'(..), Abs(..), Elim, Elim'(..), arity
-                            , ConHead(..), DataOrRecord(..), Args, argFromDom, Level'(..), PlusLevel'(..))
+                            , ConHead(..), DataOrRecord(..), Args, Sort'(..), Sort, Level, argFromDom, Level'(..), PlusLevel'(..), absurdBody)
 import Agda.Syntax.Position (Range)
 import Agda.Syntax.Translation.InternalToAbstract (reify)
 import Agda.TypeChecking.CheckInternal (infer)
@@ -42,10 +44,11 @@ import Agda.TypeChecking.Rules.Term (lambdaAddContext)
 import Agda.TypeChecking.Substitute (piApply, raise)
 import Agda.TypeChecking.Substitute.Class (apply)
 import Agda.TypeChecking.Telescope (piApplyM, flattenTel)
+import Agda.TypeChecking.Empty (isEmptyType)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Maybe (catMaybes)
 import Agda.Utils.Permutation (idP)
-import Agda.Utils.Pretty (prettyShow, render, pretty)
+import Agda.Utils.Pretty (Pretty, prettyShow, render, pretty, braces, prettyList_)
 import Agda.Utils.Tuple (mapSnd)
 import Agda.Utils.Monad (unlessM)
 import Agda.Utils.Pretty (text)
@@ -66,14 +69,16 @@ mimer :: MonadTCM tcm
   -> tcm MimerResult
 mimer ii range hint = liftTCM $ do
     oldState <- getTC
-    runBfs ii
+    sols <- runBfs True ii
     putTC oldState
     -- The meta variable to solve
     -- metaI <- lookupInteractionId ii
     -- s <- runDfs ii >>= \case
     --   Just expr -> showTCM $ expr
     --   Nothing -> return ""
-    let s = "?"
+    let s = case sols of
+          [] -> "?"
+          (sol:_) -> sol
 
     openMetas <- getOpenMetas
     mlog $ "Remaining open metas: " ++ prettyShow openMetas
@@ -354,14 +359,18 @@ data SearchBranch = SearchBranch
 data Components = Components
   { topMeta :: MetaId
   , topEnv :: TCEnv
-  , hintLocalVar :: [TypedTerm]
-  -- ^ Variables from LHS of function definition or lambda abstraction
   , hintLet :: [TypedTerm]
   -- ^ Variables bound in let
-  , hintFn :: [TypedTerm]
+  , hintFns :: [TypedTerm]
+  , hintDataTypes :: [TypedTerm]
+  , hintRecordTypes :: [TypedTerm]
+  , hintAxioms :: [TypedTerm]
+  -- ^ Excluding those producing Level
+  , hintLevel :: [TypedTerm]
   -- ^ A function
   , hintWhere :: [TypedTerm]
   -- ^ A definition in a where clause
+  , hintProjections :: [TypedTerm]
   }
 
 -- | Search Monad
@@ -373,33 +382,31 @@ data SearchStepResult
   | OpenBranch SearchBranch
   | NoSolution
 
-runBfs :: InteractionId -> SM ()
-runBfs ii = withInteractionId ii $ do
-  theFunctionQName <- ipcQName . ipClause <$> lookupInteractionPoint ii
+runBfs :: Bool -> InteractionId -> SM [String]
+runBfs stopAfterFirst ii = withInteractionId ii $ do
+
+  mTheFunctionQName <- fmap ipClause (lookupInteractionPoint ii) <&> \case
+    clause@IPClause{} -> Just $ ipcQName clause
+    IPNoClause -> Nothing
   letVars <- asksTC envLetBindings >>= mapM (fmap (mapSnd unDom) . getOpen . snd) . Map.toAscList
   metaId <- lookupInteractionId ii
   metaVar <- lookupLocalMeta metaId
-  metaArgs <- getMetaContextArgs metaVar
+
+  mlog $ "Let bindings: " ++ prettyShow letVars
   -- We remove the name of the function the interaction point occurs in to prevent
   -- arbitrary recursive calls
-  hintNames1 <- filter (/= theFunctionQName) <$> getEverythingInScope metaVar
-  records <- filterM (fmap isJust . isRecord) hintNames1
-  recordProjs <- concat  <$> mapM getRecordFields records
-  let hintNames = hintNames1 ++ recordProjs
-  hints <- sortOn (arity . snd) . catMaybes <$> mapM qnameToTerm hintNames
-  let hints' = filter (\(d,_) -> case d of Def{} -> True; _ -> False) hints
+  -- hintNames1 <- filter (/= theFunctionQName) <$> getEverythingInScope metaVar
+  -- records <- filterM (fmap isJust . isRecord) hintNames1
+  -- recordProjs <- concat  <$> mapM getRecordFields records
+  -- let hintNames = {- hintNames1 ++ -} recordProjs
+  -- hints <- sortOn (arity . snd) . catMaybes <$> mapM qnameToTerm hintNames
+  -- let hints' = filter (\(d,_) -> case d of Def{} -> True; _ -> False) hints
 
   state <- getTC
   env <- askTC
-  let components = Components
-        { topMeta = metaId
-        , topEnv = env
-        , hintLocalVar = []
-        , hintLet = []
-        , hintFn = []
-        , hintWhere = []
-        }
-      startBranch = SearchBranch { sbTCState = state, sbTCEnv = env, sbUnsolvedMetas = [metaId] }
+  components <- collectComponents mTheFunctionQName metaId
+  let startBranch = SearchBranch { sbTCState = state, sbTCEnv = env, sbUnsolvedMetas = [metaId] }
+  mlog $ "Components: " ++ prettyShow components
   mlog =<< ("startBranch=" ++) <$> prettyBranch components startBranch
 
   let go n branches
@@ -410,10 +417,13 @@ runBfs ii = withInteractionId ii $ do
           mapM_ (mlog <=< showTCM) sols
           mlog =<< (unlines <$> mapM (prettyBranch components) branches')
           mlog (replicate 61 '#')
-          (sols ++) <$> go (n-1) branches'
+          if stopAfterFirst
+          then case sols of [] -> go (n-1) branches'; _ -> return sols
+          else (sols ++) <$> go (n-1) branches'
   sols <- go 4 [startBranch]
-  mlog =<< ("Final solutions: " ++) <$> showTCM sols
-  return ()
+  solStrs <- mapM showTCM sols
+  mlog $ "Final solutions:\n" ++ unlines solStrs
+  return solStrs
   where
     partitionStepResult :: [SearchStepResult] -> ([SearchBranch], [Expr])
     partitionStepResult [] = ([],[])
@@ -423,54 +433,162 @@ runBfs ii = withInteractionId ii $ do
       ResultExpr exp -> (brs, exp:exps)
       where rest@(brs,exps) = partitionStepResult xs
 
+collectComponents :: Maybe QName -> MetaId -> TCM Components
+collectComponents mDefName metaId = do
+  env <- askTC
+  let components = Components
+        { topMeta = metaId
+        , topEnv = env
+        , hintLet = []
+        , hintFns = []
+        , hintDataTypes = []
+        , hintRecordTypes = []
+        , hintProjections = []
+        , hintAxioms = []
+        , hintLevel = []
+        , hintWhere = []
+        }
+  metaVar <- lookupLocalMeta metaId
+  hintNames <- getEverythingInScope metaVar
+  components' <- foldM go components hintNames
+  return Components
+    { topMeta = topMeta components'
+    , topEnv = topEnv components'
+    , hintLet = doSort $ hintLet components'
+    , hintFns = doSort $ hintFns components'
+    , hintDataTypes = doSort $ hintDataTypes components'
+    , hintRecordTypes = doSort $ hintRecordTypes components'
+    , hintProjections = doSort $ hintProjections components'
+    , hintAxioms = doSort $ hintAxioms components'
+    , hintLevel = doSort $ hintLevel components'
+    , hintWhere = doSort $ hintWhere components'
+    }
+  where
+    -- Sort by the arity of the type
+    doSort = sortOn (arity . snd)
+
+    isNotMutual qname f = case mDefName of
+      Nothing -> True
+      Just defName -> defName /= qname && fmap ((defName `elem`)) (funMutual f) /= Just True
+
+    go :: Components -> QName -> TCM Components
+    go comps qname = do
+      info <- getConstInfo qname
+      typ <- typeOfConst qname
+      case theDef info of
+        Axiom{} | isToLevel typ -> return comps{hintLevel = (Def qname [], typ) : hintLevel comps}
+                | otherwise -> return comps{hintAxioms = (Def qname [], typ) : hintAxioms comps}
+        -- TODO: Check if we want to use these
+        DataOrRecSig{} -> return comps
+        GeneralizableVar -> do
+          mlog $ "Collect: GeneralizeableVar " ++ prettyShow (theDef info)
+          return comps
+        AbstractDefn{} -> do
+          mlog $ "Collect: AbstractDefn " ++ prettyShow (theDef info)
+          return comps
+        -- If the function is in the same mutual block, do not include it.
+        f@Function{}
+          | isToLevel typ && isNotMutual qname f
+            -> return comps{hintLevel = (Def qname [], typ) : hintLevel comps}
+          | isNotMutual qname f
+            -> return comps{hintFns = (Def qname [], typ) : hintFns comps}
+          | otherwise -> return comps
+        Datatype{} -> return comps{hintDataTypes = (Def qname [], typ) : hintDataTypes comps}
+        Record{} -> do
+          -- TODO: remove dependency on qnameToTerm
+          projections <- catMaybes <$> (mapM qnameToTerm =<< getRecordFields qname)
+          return comps{ hintRecordTypes = (Def qname [], typ) : hintRecordTypes comps
+                      , hintProjections = projections ++ hintProjections comps}
+        -- We look up constructors when we need them
+        Constructor{} -> return comps
+        -- TODO: special treatment for primitives?
+        Primitive{} | isToLevel typ -> return comps{hintLevel = (Def qname [], typ) : hintLevel comps}
+                    | otherwise -> return comps{hintFns = (Def qname [], typ) : hintFns comps}
+        PrimitiveSort{} -> do
+          mlog $ "Collect: Primitive " ++ prettyShow (theDef info)
+          return comps
+
+    -- NOTE: We do not reduce the type before checking, so some user definitions
+    -- will not be included here.
+    isToLevel :: Type -> Bool
+    isToLevel typ = case unEl typ of
+      Pi _ abs -> isToLevel (unAbs abs)
+      Def qname _ -> prettyShow qname == builtinLevelName
+      _ -> False
+
+builtinLevelName :: String
+builtinLevelName = "Agda.Primitive.Level"
 
 bfsRefine :: Components -> SearchBranch -> SM [SearchStepResult]
 bfsRefine s branch = withBranchState branch $ do
   (metaId, branch') <- nextBranchMeta' branch
   withBranchState branch' $ do
     metaType <- reduce =<< getMetaTypeInContext metaId
-    mlog $ "bfsRefine: before lambda abstract: metaType=" ++ prettyShow metaType
     -- Lambda-abstract as far as possible
-    (metaId', metaType', branch'') <- bfsLambdaAbstract metaId metaType branch'
-    withBranchState branch'' $ do
-      mlog $ "bfsRefine: after lambda abstract: metaType'=" ++ prettyShow metaType'
-      mlog =<< ("bfsRefine: after lambda abstract: branch''=" ++) <$> prettyBranch s branch''
-      -- We reduce the meta type to WHNF(?) immediately to avoid refining it
-      -- multiple times later (required e.g. to check if it is a Pi type)
-      results1 <- bfsLocals s metaId' metaType' branch''
-      results2 <- bfsDataRecord s metaId' metaType' branch''
-      return (results1 ++ results2)
+    bfsLambdaAbstract s metaId metaType branch' >>= \case
+      -- Abstracted with absurd pattern: solution found.
+      Left expr -> return [ResultExpr expr]
+      -- Normal abstraction
+      Right (metaId', metaType', branch'') ->
+        withBranchState branch'' $ do
+          -- We reduce the meta type to WHNF(?) immediately to avoid refining it
+          -- multiple times later (required e.g. to check if it is a Pi type)
+          results1 <- bfsLocals s metaId' metaType' branch''
+          results2 <- bfsDataRecord s metaId' metaType' branch''
+          results3 <- bfsFnProjs s metaId' metaType' branch''
+          return (results1 ++ results2 ++ results3)
 
-bfsLambdaAbstract :: MetaId -> Type -> SearchBranch -> SM (MetaId, Type, SearchBranch)
-bfsLambdaAbstract metaId metaType branch =
+bfsFnProjs :: Components -> MetaId -> Type -> SearchBranch -> SM [SearchStepResult]
+bfsFnProjs s metaId metaType branch = withBranchState branch $ do
+  newBranches <- catMaybes <$> mapM (uncurry $ bfsTryRefineAddMetas s metaId metaType branch) (hintFns s)
+  mapM (checkSolved s) newBranches
+
+
+-- | Returns @Right@ for normal lambda abstraction and @Left@ for absurd lambda.
+bfsLambdaAbstract :: Components -> MetaId -> Type -> SearchBranch -> SM (Either Expr (MetaId, Type, SearchBranch))
+bfsLambdaAbstract s metaId metaType branch =
   case unEl metaType of
     Pi dom abs -> do
-      let bindName = absName abs
-      newName <- freshName_ bindName
-      lambdaAddContext newName bindName dom $ do
-        metaType' <- getMetaTypeInContext metaId
-        bodyType <- reduce =<< piApplyM metaType' (Var 0 []) -- TODO: Good place to reduce?
-        (metaId', metaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq bodyType
-
+     e <- isEmptyType (unDom dom); mlog $ "isEmptyType " ++ prettyShow (unDom dom) ++ " = " ++ show e
+     isEmptyType (unDom dom) >>= \case -- TODO: Is this the correct way of checking if absurd lambda is applicable?
+      True -> do
+        let argInf = defaultArgInfo{argInfoOrigin = Inserted} -- domInfo dom
+            term = Lam argInf absurdBody
+        mlog $ show argInf
+        assignMeta metaId term metaType
+        -- TODO: Represent absurd lambda as a Term instead of Expr.
+        -- Left . fromMaybe __IMPOSSIBLE__ <$> getMetaInstantiation metaId
+        return $ Left $ AbsurdLam exprNoRange NotHidden
+      False -> do
+        let bindName = absName abs
+        newName <- freshName_ bindName
+        (metaId', bodyType, metaTerm, env) <- lambdaAddContext newName bindName dom $ do
+          metaType' <- getMetaTypeInContext metaId
+          bodyType <- reduce =<< piApplyM metaType' (Var 0 []) -- TODO: Good place to reduce?
+          (metaId', metaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq bodyType
+          env <- askTC
+          return (metaId', bodyType, metaTerm, env)
 
         let argInf = domInfo dom -- TODO: is this the correct arg info?
-            newAbs = Abs{absName = bindName, unAbs = MetaV metaId' [] }
+            newAbs = Abs{absName = bindName, unAbs = metaTerm } --MetaV metaId' [] }
             -- look at mkLam
             term = Lam argInf newAbs
+
         assignMeta metaId term metaType
-        (metaId'', metaType'', branch'') <- bfsLambdaAbstract metaId' bodyType branch
-        return (metaId'', metaType'', branch'')
+
+        withEnv env $ do
+          branch' <- updateBranch [] branch
+          bfsLambdaAbstract s metaId' bodyType branch'
     _ -> do
       branch' <- updateBranch [] branch
-      return (metaId, metaType, branch')
+      return $ Right (metaId, metaType, branch')
 
 -- | NOTE: the MetaId should already be removed from the SearchBranch when this function is called
 bfsLocals :: Components -> MetaId -> Type -> SearchBranch -> SM [SearchStepResult]
 bfsLocals s metaId metaType branch = withBranchState branch $ do
   localVars <- getLocalVars
   newBranches <- catMaybes <$> mapM (uncurry $ bfsTryRefineAddMetas s metaId metaType branch) localVars
-  res <- mapM (checkSolved s) newBranches
-  return res
+  mapM (checkSolved s) newBranches
 
 -- TODO: Factor out `checkSolved`
 bfsDataRecord :: Components -> MetaId -> Type -> SearchBranch -> SM [SearchStepResult]
@@ -479,9 +597,46 @@ bfsDataRecord s metaId metaType branch = withBranchState branch $ do
   -- analysis as here, but it does not work for data types.
   case unEl metaType of
     Def qname elims -> theDef <$> getConstInfo qname >>= \case
-      recordDefn@Record{} -> bfsRecord recordDefn
-      dataDefn@Datatype{} -> bfsData dataDefn
-      _ -> return []
+      recordDefn@Record{} -> do
+        mlog $ "Found a Record: " ++ prettyShow recordDefn
+        bfsRecord recordDefn
+      dataDefn@Datatype{} -> do
+        mlog $ "Found a Datatype: " ++ prettyShow dataDefn
+        bfsData dataDefn
+      primitive@Primitive{} -> do
+        mlog $ "Found a Primitive: " ++ prettyShow primitive
+        return []
+      -- TODO: Better way of checking that type is Level
+      d@Axiom{}
+        | prettyShow qname == "Agda.Primitive.Level" -> do
+            bfsLevel
+        | otherwise -> do
+        mlog $ "Found an Axiom: " ++ prettyShow d ++ " qname=" ++ prettyShow qname
+        return []
+      d@DataOrRecSig{} -> do
+        mlog $ "Found a DataOrRecSig: " ++ prettyShow d
+        return []
+      d@GeneralizableVar -> do
+        mlog $ "Found a GeneralizableVar: " ++ prettyShow d
+        return []
+      d@AbstractDefn{} -> do
+        mlog $ "Found an AbstractDefn: " ++ prettyShow d
+        return []
+      d@Function{} -> do
+        mlog $ "Found a Function: " ++ prettyShow d
+        return []
+      d@Constructor{} -> do
+        mlog $ "Found a Constructor: " ++ prettyShow d
+        return []
+      d@PrimitiveSort{} -> do
+        mlog $ "Found a PrimitiveSort: " ++ prettyShow d
+        return []
+    sort@(Sort (Type level)) -> do
+      mlog $ "Found a Type: " ++ prettyShow sort
+      bfsSet level
+    Sort sort -> do
+      mlog $ "Found an sort that is not yet handled: " ++ prettyShow sort
+      return []
     _ -> return []
   where
       -- TODO: Alternatively, the constructor can be accessed via `getRecordConstructor`
@@ -505,14 +660,43 @@ bfsDataRecord s metaId metaType branch = withBranchState branch $ do
       -- TODO: Reduce overlap between e.g. bfsLocals, this and bfsRecord
       mapM (checkSolved s) (catMaybes newBranches)
 
+    bfsLevel :: TCM [SearchStepResult]
+    bfsLevel = do
+      newBranches <- catMaybes <$> mapM (uncurry $ bfsTryRefineAddMetas s metaId metaType branch) (hintLevel s)
+      mapM (checkSolved s) newBranches
+
+    -- TODO: Add an extra filtering on the sort
+    bfsSet :: Level -> TCM [SearchStepResult]
+    bfsSet level = do
+      setTerm <- reduce level >>= \case
+        reducedLevel@(Max i [])
+          | i > 0 -> return [(Sort $ Type $ Max (i-1) [], metaType)]
+          | otherwise -> do
+              mlog $ "bfsSet: don't know what to do with level " ++ prettyShow reducedLevel
+              return []
+        reducedLevel -> do
+          mlog $ "bfsSet: don't know what to do with " ++ prettyShow reducedLevel
+          return []
+      newBranches <- catMaybes <$> mapM (uncurry $ bfsTryRefineAddMetas s metaId metaType branch)
+                      (setTerm ++ concatMap ($ s)
+                       [ hintDataTypes
+                       , hintRecordTypes
+                       , hintAxioms])
+      mapM (checkSolved s) newBranches
 
 checkSolved :: Components -> SearchBranch -> SM SearchStepResult
-checkSolved s branch = withBranchState branch $ do
+checkSolved s branch = withBranchState branch $ withEnv (topEnv s) $ do
   openMetas <- getOpenMetas
   case filter (`elem` openMetas) (sbUnsolvedMetas branch) of
     [] -> do
       let metaId = topMeta s
-      maybe NoSolution ResultExpr <$> (getMetaInstantiation metaId)
+      mlog =<< ("checkSolved: context=" ++) . prettyShow <$> getContext
+      -- r <- maybe NoSolution ResultExpr <$> (getMetaInstantiation metaId)
+      getMetaInstantiation metaId >>= \case
+        Nothing -> return NoSolution
+        Just e -> do
+          mlog =<< ("checkSolved: result=" ++) <$> showTCM e
+          return (ResultExpr e)
     remainingMetas -> return $ OpenBranch branch{sbUnsolvedMetas = remainingMetas}
 
 -- | Type should already be reduced here
@@ -619,8 +803,8 @@ getEverythingInScope metaVar = do
 dumbUnifier :: Type -> Type -> TCM Bool
 dumbUnifier t1 t2 =
   (noConstraints $ equalType t2 t1 >> return True) `catchError` \err -> do
-    str <- showTCM err
-    mlog $ "dumbUnifier error: " ++ str
+--     str <- showTCM err
+--     mlog $ "dumbUnifier error: " ++ str
     return False
 
 getDomainType :: Type -> Type
@@ -726,3 +910,17 @@ withLocalTCState state ma = do
   res <- ma
   putTC state'
   return res
+
+instance Pretty Components where
+  pretty comps =
+    text "Components" <> braces (prettyList_
+      [ text "topMeta={...}"
+      , text "topEnv={...}"
+      , text "hintLet=" <> pretty (hintLet comps)
+      , text "hintFns=" <> pretty (hintFns comps)
+      , text "hintDataTypes=" <> pretty (hintDataTypes comps)
+      , text "hintRecordTypes=" <> pretty (hintRecordTypes comps)
+      , text "hintAxioms=" <> pretty (hintAxioms comps)
+      , text "hintLevel=" <> pretty (hintLevel comps)
+      , text "hintWhere=" <> pretty (hintWhere comps)
+      , text "hintProjections=" <> pretty (hintProjections comps)])
