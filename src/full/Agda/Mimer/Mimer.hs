@@ -11,7 +11,7 @@ import Control.Monad.Except (catchError)
 import Control.Monad.State (StateT, gets)
 import Control.Monad.Reader (ReaderT(..), runReaderT, mapReaderT, ask, asks)
 import qualified Data.Map as Map
-import Data.List (sortOn, isSuffixOf, intercalate)
+import Data.List (sortOn, isSuffixOf, intercalate, intersect)
 import Data.Maybe (isJust)
 import Data.Function (on)
 import qualified Data.IntSet as IntSet
@@ -26,6 +26,7 @@ import Agda.Syntax.Abstract.Name (QName(..))
 import Agda.Syntax.Common (InteractionId, MetaId(..), Arg(..), ArgInfo(..), defaultArgInfo, Origin(..),Induction(..), ConOrigin(..), Hiding(..), setOrigin, NameId, ProblemId, Nat)
 import Agda.Syntax.Info (exprNoRange)
 import Agda.Syntax.Internal (MetaId, Type, Type''(..), Term(..), Dom'(..), Abs(..), Elim, Elim'(..), arity , ConHead(..), DataOrRecord(..), Args, Sort'(..), Sort, Level, argFromDom, Level'(..), PlusLevel'(..), absurdBody)
+import Agda.Syntax.Internal.MetaVars (AllMetas(..))
 import Agda.Syntax.Internal.Generic (TermLike, traverseTermM)
 import Agda.Syntax.Position (Range)
 import Agda.Syntax.Translation.InternalToAbstract (reify)
@@ -421,34 +422,52 @@ runBfs stopAfterFirst ii = withInteractionId ii $ do
   state <- getTC
   env <- askTC
   components <- collectComponents mTheFunctionQName metaId
-  let startBranch = SearchBranch
-       { sbTCState = state
-       , sbTCEnv = env
-       , sbGoals = [mkGoal metaId]
-       }
 
-  let options = SearchOptions { searchComponents = components
-                              , searchTopMeta = metaId
-                              , searchTopEnv = env
-                              }
-  flip runReaderT options $ do
-    mlog $ "Components: " ++ prettyShow components
-    mlog =<< ("startBranch=" ++) <$> prettyBranch startBranch
-    let go n branches
-          | n <= 0 = return []
-          | otherwise = do
-            (branches', sols) <- partitionStepResult <$> concatMapM bfsRefine branches
-            mlog $ replicate 30 '#' ++ show n ++ replicate 30 '#'
-            mapM_ (mlog <=< showTCM) sols
-            mlog =<< (unlines <$> mapM prettyBranch branches')
-            mlog (replicate 61 '#')
-            if stopAfterFirst
-            then case sols of [] -> go (n-1) branches'; _ -> return sols
-            else (sols ++) <$> go (n-1) branches'
-    sols <- go 4 [startBranch]
-    solStrs <- mapM showTCM sols
-    mlog $ "Final solutions:\n" ++ unlines solStrs
-    return solStrs
+
+  -- TODO: What if metaIds is empty? (The whole thing was solved by unification)
+  metaIds <- case mvInstantiation metaVar of
+    InstV inst -> do
+      metaIds <- allOpenMetas (instBody inst)
+      mlog $ "Instantiation already present at top-level: " ++  prettyShow (instBody inst) ++ " remaining metas: " ++ prettyShow metaIds ++ " all occurring metas: " ++ prettyShow (allMetas (:[]) (instBody inst))
+      return metaIds
+    Open -> do
+      mlog $ "No insantiation present at top-level."
+      return [metaId]
+    _ -> __IMPOSSIBLE__
+
+  -- Check if there are any meta variables to be solved
+  case metaIds of
+    -- No variables to solve, return the instantiation given
+    [] -> (:[]) <$> (showTCM =<< fromMaybe __IMPOSSIBLE__ <$> getMetaInstantiation metaId)
+    _ -> do
+      let startBranch = SearchBranch
+            { sbTCState = state
+            , sbTCEnv = env
+            , sbGoals = map mkGoal metaIds
+            }
+
+      let options = SearchOptions { searchComponents = components
+                                  , searchTopMeta = metaId
+                                  , searchTopEnv = env
+                                  }
+      flip runReaderT options $ do
+        mlog $ "Components: " ++ prettyShow components
+        mlog =<< ("startBranch: " ++) <$> prettyBranch startBranch
+        let go n branches
+              | n <= 0 = return []
+              | otherwise = do
+                (branches', sols) <- partitionStepResult <$> concatMapM bfsRefine branches
+                mlog $ replicate 30 '#' ++ show n ++ replicate 30 '#'
+                mapM_ (mlog <=< showTCM) sols
+                mlog =<< (unlines <$> mapM prettyBranch branches')
+                mlog (replicate 61 '#')
+                if stopAfterFirst
+                then case sols of [] -> go (n-1) branches'; _ -> return sols
+                else (sols ++) <$> go (n-1) branches'
+        sols <- go 4 [startBranch]
+        solStrs <- mapM showTCM sols
+        mlog $ "Final solutions:\n" ++ unlines solStrs
+        return solStrs
   where
     partitionStepResult :: [SearchStepResult] -> ([SearchBranch], [Expr])
     partitionStepResult [] = ([],[])
@@ -1024,3 +1043,8 @@ predNat :: Nat -> Nat
 predNat n | n > 0 = n - 1
           | n == 0 = 0
           | otherwise = error "predNat of negative value"
+
+allOpenMetas :: (AllMetas t, ReadTCState tcm) => t -> tcm [MetaId]
+allOpenMetas t = do
+  openMetas <- getOpenMetas
+  return $ allMetas (:[]) t `intersect` openMetas
