@@ -11,10 +11,16 @@ import Control.Monad.Except (catchError)
 import Control.Monad.State (StateT, gets)
 import Control.Monad.Reader (ReaderT(..), runReaderT, mapReaderT, ask, asks)
 import qualified Data.Map as Map
+import Data.Map (Map)
 import Data.List (sortOn, isSuffixOf, intercalate, intersect)
 import Data.Maybe (isJust)
 import Data.Function (on)
 import qualified Data.IntSet as IntSet
+import Data.Function (on)
+
+import Data.Time.Clock (diffUTCTime, getCurrentTime, secondsToNominalDiffTime)
+import qualified Data.PQueue.Min as Q
+import Data.PQueue.Min (MinQueue)
 
 import Agda.Compiler.Backend (getMetaContextArgs, TCState(..), PostScopeState(..), Open(..), isOpenMeta, getContextTerms)
 import Agda.Interaction.Base
@@ -22,10 +28,10 @@ import Agda.Interaction.Base (Rewrite(..))
 import Agda.Interaction.BasicOps (typeOfMetaMI, contextOfMeta )
 import Agda.Interaction.Response (ResponseContextEntry(..))
 import Agda.Syntax.Abstract (Expr(AbsurdLam))
-import Agda.Syntax.Abstract.Name (QName(..))
+import Agda.Syntax.Abstract.Name (QName(..), Name(..))
 import Agda.Syntax.Common (InteractionId, MetaId(..), Arg(..), ArgInfo(..), defaultArgInfo, Origin(..),Induction(..), ConOrigin(..), Hiding(..), setOrigin, NameId, ProblemId, Nat)
 import Agda.Syntax.Info (exprNoRange)
-import Agda.Syntax.Internal (MetaId, Type, Type''(..), Term(..), Dom'(..), Abs(..), Elim, Elim'(..), arity , ConHead(..), DataOrRecord(..), Args, Sort'(..), Sort, Level, argFromDom, Level'(..), PlusLevel'(..), absurdBody)
+import Agda.Syntax.Internal (MetaId, Type, Type''(..), Term(..), Dom'(..), Abs(..), Elim, Elim'(..), arity , ConHead(..), DataOrRecord(..), Args, Sort'(..), Sort, Level, argFromDom, Level'(..), PlusLevel'(..), absurdBody, Dom)
 import Agda.Syntax.Internal.MetaVars (AllMetas(..))
 import Agda.Syntax.Internal.Generic (TermLike, traverseTermM)
 import Agda.Syntax.Position (Range)
@@ -52,7 +58,7 @@ import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Maybe (catMaybes)
 import Agda.Utils.Permutation (idP)
 import Agda.Utils.Pretty (Pretty, prettyShow, render, pretty, braces, prettyList_)
-import Agda.Utils.Tuple (mapSnd)
+import Agda.Utils.Tuple (mapFst, mapSnd)
 import Agda.Utils.Monad (unlessM)
 import Agda.Utils.Pretty (text)
 import qualified Agda.Syntax.Scope.Base as Scope
@@ -100,9 +106,6 @@ mimer ii range hint = liftTCM $  do
 
 
 type TypedTerm = (Term, Type)
-
-
-
 
 
 -- TODO: withInteractionId to get the right context
@@ -196,6 +199,9 @@ qnameToTerm qname = do
   return ((,typ) <$> mTerm)
 
 
+qnameToComp :: (MonadTCM tcm, HasConstInfo tcm, ReadTCState tcm) => QName -> tcm (Maybe Component)
+qnameToComp qname = fmap (uncurry $ mkComponentQ qname) <$> qnameToTerm qname
+
 -- TODO: Check how giveExpr (intercation basic ops) -- v' <- instantiate $ MetaV mi $ map Apply ctx
 dfs :: [(Term, Type)] -> Int -> MetaId -> TCM (Maybe Term)
 dfs hints depth metaId = do
@@ -210,7 +216,7 @@ dfs hints depth metaId = do
       -- Max depth not reached, continue search
       | otherwise -> do
           metaType <- reduce =<< getMetaTypeInContext metaId
-          localVars <- getLocalVars
+          localVars <- map (\c -> (compTerm c, compType c)) <$> getLocalVars
           go localVars
             `elseTry` tryDataCon hints depth metaId
             `elseTry` go hints
@@ -358,44 +364,77 @@ tryLambda hints depth metaId = do
 
 data SearchBranch = SearchBranch
   { sbTCState :: TCState
-  , sbTCEnv :: TCEnv
+  -- , sbTCEnv :: TCEnv
   , sbGoals :: [Goal]
+  , sbCost :: Int
+  , sbComponentsUsed :: Map Name Int -- ^ Number of times each component has been used
   }
+
+-- | NOTE: Equality is only on the field `sbCost`
+instance Eq SearchBranch where
+  sb1 == sb2 = sbCost sb1 == sbCost sb2 && sbGoals sb1 == sbGoals sb2
+
+
+instance Ord SearchBranch where
+  compare = compare `on` sbCost
 
 data Goal = Goal
   { goalMeta :: MetaId
-  , goalLetVars :: Maybe [TypedTerm]
-  , goalLocalVars :: Maybe [TypedTerm]
+  , goalLetVars :: Maybe [Component]
+  , goalLocalVars :: Maybe [Component]
+  , goalEnv :: TCEnv
   }
 
-mkGoal :: MetaId -> Goal
-mkGoal metaId = Goal
-  { goalMeta = metaId
-  , goalLetVars = Nothing
-  , goalLocalVars = Nothing
-  }
+-- TODO: Is this a reasonable Eq instance?
+instance Eq Goal where
+  g1 == g2 = goalMeta g1 == goalMeta g2
 
-mkGoalPreserveLocals :: Goal -> MetaId -> Goal
-mkGoalPreserveLocals goalLocalSource metaId = Goal
+-- | Create a goal in the current environment
+mkGoal :: MonadTCEnv m => MetaId -> m Goal
+mkGoal metaId = do
+  env <- askTC
+  return Goal
+    { goalMeta = metaId
+    , goalLetVars = Nothing
+    , goalLocalVars = Nothing
+    , goalEnv = env
+    }
+
+mkGoalPreserveLocalsAndEnv :: Goal -> MetaId -> Goal
+mkGoalPreserveLocalsAndEnv goalLocalSource metaId = Goal
   { goalMeta = metaId
   , goalLetVars = goalLetVars goalLocalSource
   , goalLocalVars = goalLocalVars goalLocalSource
+  , goalEnv = goalEnv goalLocalSource
   }
 
 -- | Components that are not changed during search. Components that do change
 -- (local variables and let bindings) are stored in each 'SearchBranch'.
 data Components = Components
-  { hintFns :: [TypedTerm]
-  , hintDataTypes :: [TypedTerm]
-  , hintRecordTypes :: [TypedTerm]
-  , hintAxioms :: [TypedTerm]
+  { hintFns :: [Component]
+  , hintDataTypes :: [Component]
+  , hintRecordTypes :: [Component]
+  , hintAxioms :: [Component]
   -- ^ Excluding those producing Level
-  , hintLevel :: [TypedTerm]
+  , hintLevel :: [Component]
   -- ^ A function
-  , hintWhere :: [TypedTerm]
+  , hintWhere :: [Component]
   -- ^ A definition in a where clause
-  , hintProjections :: [TypedTerm]
+  , hintProjections :: [Component]
   }
+
+data Component = Component {compTerm :: Term, compType :: Type, compName :: Maybe Name}
+  deriving Eq
+
+mkComponent :: Maybe Name -> Term -> Type -> Component
+mkComponent name term typ = Component { compTerm = term, compType = typ, compName = name}
+
+mkComponentN :: Name -> Term -> Type -> Component
+mkComponentN = mkComponent . Just
+
+mkComponentQ :: QName -> Term -> Type -> Component
+mkComponentQ = mkComponentN . qnameName
+
 
 data SearchStepResult
   = ResultExpr Expr
@@ -440,45 +479,62 @@ runBfs stopAfterFirst ii = withInteractionId ii $ do
     -- No variables to solve, return the instantiation given
     [] -> (:[]) <$> (showTCM =<< fromMaybe __IMPOSSIBLE__ <$> getMetaInstantiation metaId)
     _ -> do
+      startGoals <- mapM mkGoal metaIds
       let startBranch = SearchBranch
             { sbTCState = state
-            , sbTCEnv = env
-            , sbGoals = map mkGoal metaIds
+            , sbGoals = startGoals
+            , sbCost = 0
+            , sbComponentsUsed = Map.empty
             }
 
       let options = SearchOptions { searchComponents = components
                                   , searchTopMeta = metaId
                                   , searchTopEnv = env
+                                  , searchCosts = defaultCosts
                                   }
       flip runReaderT options $ do
         mlog $ "Components: " ++ prettyShow components
         mlog =<< ("startBranch: " ++) <$> prettyBranch startBranch
-        let go n branches
-              | n <= 0 = return []
-              | otherwise = do
-                (branches', sols) <- partitionStepResult <$> concatMapM bfsRefine branches
-                mlog $ replicate 30 '#' ++ show n ++ replicate 30 '#'
-                mapM_ (mlog <=< showTCM) sols
-                mlog =<< (unlines <$> mapM prettyBranch branches')
-                mlog (replicate 61 '#')
-                if stopAfterFirst
-                then case sols of [] -> go (n-1) branches'; _ -> return sols
-                else (sols ++) <$> go (n-1) branches'
-        sols <- go 4 [startBranch]
+
+        startTime <- liftIO $ getCurrentTime
+        let go n allBranches = case Q.minView allBranches of
+              Nothing -> return ([], n)
+              Just (branch, branches) -> do
+                time <- liftIO $ getCurrentTime
+
+                if diffUTCTime time startTime < secondsToNominalDiffTime 30
+                then do
+                  (branches', sols) <- partitionStepResult branches <$> bfsRefine branch
+                  mlog $ replicate 30 '#' ++ show n ++ replicate 30 '#'
+                  mapM_ (mlog <=< showTCM) sols
+                  mlog =<< (unlines <$> mapM prettyBranch (Q.toList branches'))
+                  mlog (replicate 61 '#')
+                  if stopAfterFirst
+                  then case sols of [] -> go (n+1) branches'; _ -> return (sols, n)
+                  else mapFst (sols ++) <$> go (n+1) branches'
+                else do
+                  mlog' $ "Time limit reached."
+                  return ([], n)
+        (sols, nrSteps) <- go 0 $ Q.singleton startBranch
         solStrs <- mapM showTCM sols
-        mlog $ "Final solutions:\n" ++ unlines solStrs
+        mlog' $ "Final solution (after " ++ show nrSteps ++ " steps)\n: " ++ unlines solStrs
         return solStrs
   where
-    partitionStepResult :: [SearchStepResult] -> ([SearchBranch], [Expr])
-    partitionStepResult [] = ([],[])
-    partitionStepResult (x:xs) = case x of
+    partitionStepResult :: MinQueue SearchBranch -> [SearchStepResult] -> (MinQueue SearchBranch, [Expr])
+    partitionStepResult brs [] = (brs,[])
+    partitionStepResult brs (x:xs) = case x of
       NoSolution -> rest
-      OpenBranch br -> (br:brs,exps)
-      ResultExpr exp -> (brs, exp:exps)
-      where rest@(brs,exps) = partitionStepResult xs
+      OpenBranch br -> (Q.insert br brs', exps)
+      ResultExpr exp -> (brs', exp:exps)
+      where rest@(brs',exps) = partitionStepResult brs xs
 
-getLetVars :: MonadTCM tcm => tcm [TypedTerm]
-getLetVars = asksTC envLetBindings >>= mapM (fmap (mapSnd unDom) . getOpen . snd) . Map.toAscList
+getLetVars :: MonadTCM tcm => tcm [Component]
+getLetVars = asksTC envLetBindings >>= mapM bindingToComp . Map.toAscList
+  where
+    bindingToComp :: MonadTCM tcm => (Name, Open (Term, Dom Type)) -> tcm Component
+    bindingToComp (name, is) = do
+      (term, typ) <- getOpen is
+      return $ mkComponentN name term (unDom typ)
 
 
 collectComponents :: (MonadTCM tcm, ReadTCState tcm, HasConstInfo tcm, MonadFresh NameId tcm, MonadInteractionPoints tcm, MonadStConcreteNames tcm, PureTCM tcm)
@@ -507,7 +563,7 @@ collectComponents mDefName metaId = do
     }
   where
     -- Sort by the arity of the type
-    doSort = sortOn (arity . snd)
+    doSort = sortOn (arity . compType)
 
     isNotMutual qname f = case mDefName of
       Nothing -> True
@@ -517,8 +573,8 @@ collectComponents mDefName metaId = do
       info <- getConstInfo qname
       typ <- typeOfConst qname
       case theDef info of
-        Axiom{} | isToLevel typ -> return comps{hintLevel = (Def qname [], typ) : hintLevel comps}
-                | otherwise -> return comps{hintAxioms = (Def qname [], typ) : hintAxioms comps}
+        Axiom{} | isToLevel typ -> return comps{hintLevel = mkComponentQ qname (Def qname []) typ : hintLevel comps}
+                | otherwise -> return comps{hintAxioms = mkComponentQ qname (Def qname []) typ : hintAxioms comps}
         -- TODO: Check if we want to use these
         DataOrRecSig{} -> return comps
         GeneralizableVar -> do
@@ -530,21 +586,21 @@ collectComponents mDefName metaId = do
         -- If the function is in the same mutual block, do not include it.
         f@Function{}
           | isToLevel typ && isNotMutual qname f
-            -> return comps{hintLevel = (Def qname [], typ) : hintLevel comps}
+            -> return comps{hintLevel = mkComponentQ qname (Def qname []) typ : hintLevel comps}
           | isNotMutual qname f
-            -> return comps{hintFns = (Def qname [], typ) : hintFns comps}
+            -> return comps{hintFns = mkComponentQ qname (Def qname []) typ : hintFns comps}
           | otherwise -> return comps
-        Datatype{} -> return comps{hintDataTypes = (Def qname [], typ) : hintDataTypes comps}
+        Datatype{} -> return comps{hintDataTypes = mkComponentQ qname (Def qname []) typ : hintDataTypes comps}
         Record{} -> do
           -- TODO: remove dependency on qnameToTerm
-          projections <- catMaybes <$> (mapM qnameToTerm =<< getRecordFields qname)
-          return comps{ hintRecordTypes = (Def qname [], typ) : hintRecordTypes comps
+          projections <- catMaybes <$> (mapM qnameToComp =<< getRecordFields qname)
+          return comps{ hintRecordTypes = mkComponentQ qname (Def qname []) typ : hintRecordTypes comps
                       , hintProjections = projections ++ hintProjections comps}
         -- We look up constructors when we need them
         Constructor{} -> return comps
         -- TODO: special treatment for primitives?
-        Primitive{} | isToLevel typ -> return comps{hintLevel = (Def qname [], typ) : hintLevel comps}
-                    | otherwise -> return comps{hintFns = (Def qname [], typ) : hintFns comps}
+        Primitive{} | isToLevel typ -> return comps{hintLevel = mkComponentQ qname (Def qname []) typ : hintLevel comps}
+                    | otherwise -> return comps{hintFns = mkComponentQ qname (Def qname []) typ : hintFns comps}
         PrimitiveSort{} -> do
           mlog $ "Collect: Primitive " ++ prettyShow (theDef info)
           return comps
@@ -563,7 +619,7 @@ builtinLevelName = "Agda.Primitive.Level"
 bfsRefine :: SearchBranch -> SM [SearchStepResult]
 bfsRefine branch = withBranchState branch $ do
   (goal, branch') <- nextBranchMeta' branch
-  withBranchState branch' $ do
+  withBranchAndGoal branch' goal $ do
     goalType <- reduce =<< getMetaTypeInContext (goalMeta goal)
     -- Lambda-abstract as far as possible
     bfsLambdaAbstract goal goalType branch' >>= \case
@@ -571,7 +627,7 @@ bfsRefine branch = withBranchState branch $ do
       Left expr -> return [ResultExpr expr]
       -- Normal abstraction
       Right (goal', goalType', branch'') ->
-        withBranchState branch'' $ do
+        withBranchAndGoal branch'' goal' $ do
           -- We reduce the meta type to WHNF(?) immediately to avoid refining it
           -- multiple times later (required e.g. to check if it is a Pi type)
           results1 <- bfsLocals goal' goalType' branch''
@@ -581,15 +637,15 @@ bfsRefine branch = withBranchState branch $ do
           return (results1 ++ results2 ++ results3 ++ results4)
 
 bfsFnProjs :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
-bfsFnProjs goal goalType branch = withBranchState branch $ do
+bfsFnProjs goal goalType branch = withBranchAndGoal branch goal $ do
   fns <- asks (hintFns . searchComponents)
-  newBranches <- catMaybes <$> mapM (uncurry $ bfsTryRefineAddMetas goal goalType branch) fns
+  newBranches <- catMaybes <$> mapM (bfsTryRefineAddMetas costFn goal goalType branch) fns
   mapM checkSolved newBranches
 
 bfsLet :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
-bfsLet goal goalType branch = withBranchState branch $ do
+bfsLet goal goalType branch = withBranchAndGoal branch goal $ do
   (goal', letVars) <- getLetVarsCached
-  newBranches <- catMaybes <$> mapM (uncurry $ bfsTryRefineAddMetas goal' goalType branch) letVars
+  newBranches <- catMaybes <$> mapM (bfsTryRefineAddMetas costLet goal' goalType branch) letVars
   mapM checkSolved newBranches
   where getLetVarsCached =
           -- Does the goal already have computed let bindings?
@@ -613,7 +669,8 @@ bfsLambdaAbstract goal goalType branch =
         let argInf = defaultArgInfo{argInfoOrigin = Inserted} -- domInfo dom
             term = Lam argInf absurdBody
         mlog $ show argInf
-        assignMeta (goalMeta goal) term goalType
+        newMetaIds <- assignMeta (goalMeta goal) term goalType
+        unless (null newMetaIds) (__IMPOSSIBLE__)
         -- TODO: Represent absurd lambda as a Term instead of Expr.
         -- Left . fromMaybe __IMPOSSIBLE__ <$> getMetaInstantiation (goalMeta metaId)
         return $ Left $ AbsurdLam exprNoRange NotHidden
@@ -624,7 +681,11 @@ bfsLambdaAbstract goal goalType branch =
           goalType' <- getMetaTypeInContext (goalMeta goal)
           bodyType <- reduce =<< piApplyM goalType' (Var 0 []) -- TODO: Good place to reduce?
           (metaId', metaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq bodyType
+          mlog $ "Created meta " ++ prettyShow metaId' ++ " in bfsLambdaAbstract"
           env <- askTC
+
+          ctx <- getContextTelescope
+          mlog $ prettyShow ctx
           return (metaId', bodyType, metaTerm, env)
 
         let argInf = domInfo dom -- TODO: is this the correct arg info?
@@ -632,25 +693,26 @@ bfsLambdaAbstract goal goalType branch =
             -- look at mkLam
             term = Lam argInf newAbs
 
-        assignMeta (goalMeta goal) term goalType
+        newMetaIds <- assignMeta (goalMeta goal) term goalType
 
         withEnv env $ do
-          branch' <- updateBranch [] branch
-          bfsLambdaAbstract (mkGoal metaId') bodyType branch'
+          branch' <- updateBranch newMetaIds branch
+          goal' <- mkGoal metaId'
+          bfsLambdaAbstract goal' bodyType branch'
     _ -> do
       branch' <- updateBranch [] branch
       return $ Right (goal, goalType, branch')
 
 -- | NOTE: the MetaId should already be removed from the SearchBranch when this function is called
 bfsLocals :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
-bfsLocals goal goalType branch = withBranchState branch $ do
+bfsLocals goal goalType branch = withBranchAndGoal branch goal $ do
   localVars <- getLocalVars
-  newBranches <- catMaybes <$> mapM (uncurry $ bfsTryRefineAddMetas goal goalType branch) localVars
+  newBranches <- catMaybes <$> mapM (bfsTryRefineAddMetas costLocal goal goalType branch) localVars
   mapM checkSolved newBranches
 
 -- TODO: Factor out `checkSolved`
 bfsDataRecord :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
-bfsDataRecord goal goalType branch = withBranchState branch $ do
+bfsDataRecord goal goalType branch = withBranchAndGoal branch goal $ do
   -- TODO: There is a `isRecord` function, which performs a similar case
   -- analysis as here, but it does not work for data types.
   case unEl goalType of
@@ -705,23 +767,24 @@ bfsDataRecord goal goalType branch = withBranchState branch $ do
           cName = conName cHead
           cTerm = Con cHead ConOSystem []
       cType <- typeOfConst cName
+      let comp = mkComponentQ (conName cHead) cTerm cType
       -- -- NOTE: at most 1
-      newBranches <- maybeToList <$> bfsTryRefineAddMetasSkip (recPars recordDefn) goal goalType branch cTerm cType
+      newBranches <- maybeToList <$> bfsTryRefineAddMetasSkip costRecordCon (recPars recordDefn) goal goalType branch comp
       mapM checkSolved newBranches
 
     bfsData :: Defn -> SM [SearchStepResult]
     bfsData dataDefn = do
       -- Get the constructors as [(Term, Type)]
       -- TODO: prioritize constructors with few arguments. E.g. @sortOn (artity . snd)@
-      typedTerms <- mapM (fmap (fromMaybe __IMPOSSIBLE__) . qnameToTerm) (dataCons dataDefn)
-      newBranches <- mapM (uncurry $ bfsTryRefineAddMetas goal goalType branch) typedTerms
+      comps <- mapM (fmap (fromMaybe __IMPOSSIBLE__) . qnameToComp) (dataCons dataDefn)
+      newBranches <- mapM (bfsTryRefineAddMetas costDataCon goal goalType branch) comps
       -- TODO: Reduce overlap between e.g. bfsLocals, this and bfsRecord
       mapM checkSolved (catMaybes newBranches)
 
     bfsLevel :: SM [SearchStepResult]
     bfsLevel = do
       levelHints <- asks (hintLevel . searchComponents)
-      newBranches <- catMaybes <$> mapM (uncurry $ bfsTryRefineAddMetas goal goalType branch) levelHints
+      newBranches <- catMaybes <$> mapM (bfsTryRefineAddMetas costLevel goal goalType branch) levelHints
       mapM checkSolved newBranches
 
     -- TODO: Add an extra filtering on the sort
@@ -729,7 +792,7 @@ bfsDataRecord goal goalType branch = withBranchState branch $ do
     bfsSet level = do
       setTerm <- reduce level >>= \case
         reducedLevel@(Max i [])
-          | i > 0 -> return [(Sort $ Type $ Max (i-1) [], goalType)]
+          | i > 0 -> return [mkComponent Nothing (Sort $ Type $ Max (i-1) []) goalType]
           | otherwise -> do
               mlog $ "bfsSet: don't know what to do with level " ++ prettyShow reducedLevel
               return []
@@ -737,7 +800,7 @@ bfsDataRecord goal goalType branch = withBranchState branch $ do
           mlog $ "bfsSet: don't know what to do with " ++ prettyShow reducedLevel
           return []
       components <- asks searchComponents
-      newBranches <- catMaybes <$> mapM (uncurry $ bfsTryRefineAddMetas goal goalType branch)
+      newBranches <- catMaybes <$> mapM (bfsTryRefineAddMetas costSet goal goalType branch)
                       (setTerm ++ concatMap ($ components)
                        [ hintDataTypes
                        , hintRecordTypes
@@ -764,38 +827,49 @@ checkSolved branch = do
 -- | Type should already be reduced here
 -- NOTE: Does not reset the state!
 -- TODO: Make sure the type is always reduced
-bfsTryRefineWith :: Goal -> Type -> SearchBranch -> Term -> Type -> SM (Maybe SearchBranch)
-bfsTryRefineWith goal goalType branch hintTerm hintType = withBranchState branch $ do
-  metasCreatedBy (dumbUnifier hintType goalType) >>= \case
+bfsTryRefineWith :: (Costs -> Int) -> Goal -> Type -> SearchBranch -> Component -> SM (Maybe SearchBranch)
+bfsTryRefineWith costFn goal goalType branch comp = withBranchAndGoal branch goal $ do
+  mlog $ "Trying refine: " ++ prettyShow comp ++ " for " ++ prettyShow (goalMeta goal) ++ ":" ++ prettyShow goalType ++ ".."
+  metasCreatedBy (dumbUnifier (compType comp) goalType) >>= \case
     (True, newMetaStore) -> do
-      assignMeta (goalMeta goal) hintTerm goalType
+      mlog $ "   ..succeeded."
+      newMetaIds <- assignMeta (goalMeta goal) (compTerm comp) goalType
       -- TODO: check if everything is solved?
-      let newMetaIds = Map.keys (openMetas newMetaStore)
-      Just <$> updateBranch newMetaIds branch
-    (False, _) -> return Nothing
+      let newMetaIds' = Map.keys (openMetas newMetaStore)
+      mlog $ "  New metas (bfsTryRefineWith): " ++ prettyShow newMetaIds'
+      Just <$> updateBranchCost costFn comp newMetaIds' branch
+    (False, _) -> do
+      mlog $ "   ..failed."
+      return Nothing
 
 
 -- TODO: Make policy for when state should be put
-bfsTryRefineAddMetasSkip :: Nat -> Goal -> Type -> SearchBranch -> Term -> Type -> SM (Maybe SearchBranch)
-bfsTryRefineAddMetasSkip skip goal goalType branch hintTerm hintType = withBranchState branch $ do
+bfsTryRefineAddMetasSkip :: (Costs -> Int) -> Nat -> Goal -> Type -> SearchBranch -> Component -> SM (Maybe SearchBranch)
+bfsTryRefineAddMetasSkip costFn skip goal goalType branch comp = withBranchAndGoal branch goal $ do
   -- Apply the hint to new metas (generating @c@, @c ?@, @c ? ?@, etc.)
-  (hintTerm', hintType', newMetas) <- applyToMetas skip hintTerm hintType
+  -- TODO: Where is the best pace to reduce the hint type?
+  (hintTerm', hintType', newMetas) <- applyToMetas skip (compTerm comp) =<< reduce (compType comp)
+  let comp' = mkComponent (compName comp) hintTerm' hintType'
   branch' <- updateBranch [] branch
-  fmap (addBranchGoals $ map (mkGoalPreserveLocals goal) $ reverse newMetas) <$> bfsTryRefineWith goal goalType branch' hintTerm' hintType'
+  fmap (addBranchGoals $ map (mkGoalPreserveLocalsAndEnv goal) $ reverse newMetas) <$> bfsTryRefineWith costFn goal goalType branch' comp'
 
-bfsTryRefineAddMetas :: Goal -> Type -> SearchBranch -> Term -> Type -> SM (Maybe SearchBranch)
-bfsTryRefineAddMetas = bfsTryRefineAddMetasSkip 0
+bfsTryRefineAddMetas :: (Costs -> Int) -> Goal -> Type -> SearchBranch -> Component -> SM (Maybe SearchBranch)
+bfsTryRefineAddMetas costFn = bfsTryRefineAddMetasSkip costFn 0
 
 -- TODO: Make sure the type is reduced the first time this is called
+-- TODO: Rewrite with Component?
 -- NOTE: The new metas are in left-to-right order -- the opposite of the
 -- order they should be solved in.
 applyToMetas :: Nat -> Term -> Type -> SM (Term, Type, [MetaId])
 applyToMetas skip term typ = do
+  ctx <- getContextTelescope
+  mlog $ prettyShow ctx
   case unEl typ of
     Pi dom abs -> do
       let domainType = unDom dom
       -- TODO: What exactly does the occur check do?
       (metaId', metaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq domainType
+      mlog $ "Created meta " ++ prettyShow metaId' ++ " in applyToMetas"
       let arg = setOrigin Inserted $ metaTerm <$ argFromDom dom
       newType <- reduce =<< piApplyM typ metaTerm -- TODO: Is this the best place to reduce?
       -- For records, the parameters are not included in the term
@@ -805,29 +879,58 @@ applyToMetas skip term typ = do
     _ -> return (term, typ, [])
 
 
-updateBranch :: [MetaId] -> SearchBranch -> SM SearchBranch
-updateBranch newMetaIds branch = do
+updateBranch' :: Maybe (Costs -> Int, Component) -> [MetaId] -> SearchBranch -> SM SearchBranch
+updateBranch' costs newMetaIds branch = do
   state <- getTC
   env <- askTC
-  let newOpenMetas = map mkGoal newMetaIds
+  let compsUsed = sbComponentsUsed branch
+  (deltaCost, compsUsed') <- case costs of
+        Nothing -> return (0, compsUsed)
+        Just (costFn, comp) -> do
+          cost1 <- asks (costFn . searchCosts)
+          let p = cost1 :: Int
+          case compName comp of
+            Nothing -> return (cost1, compsUsed)
+            Just name -> case compsUsed Map.!? name of
+              Nothing -> return (cost1, Map.insert name 1 compsUsed)
+              -- TODO: Currently using: uses^2+1 as cost. Make a parameter?
+              Just uses -> return (cost1 + uses * uses + 2, Map.adjust succ name compsUsed)
+  newGoals <- mapM mkGoal newMetaIds
   return branch{ sbTCState = state
-               , sbTCEnv = env
-               , sbGoals = newOpenMetas ++ sbGoals branch }
+               , sbGoals = newGoals ++ sbGoals branch
+               , sbCost = sbCost branch + deltaCost
+               , sbComponentsUsed = compsUsed'
+               }
 
-assignMeta :: MetaId -> Term -> Type -> SM ()
-assignMeta metaId term metaType = do
-  metaVar <- lookupLocalMeta metaId
-  metaArgs <- getMetaContextArgs metaVar
-  mlog $ "assignMeta: assigning " ++ prettyShow term ++ " to " ++ prettyShow metaId
-  assignV DirLeq metaId metaArgs term (AsTermsOf metaType)
+updateBranch :: [MetaId] -> SearchBranch -> SM SearchBranch
+updateBranch = updateBranch' Nothing
+
+updateBranchCost :: (Costs -> Int) -> Component -> [MetaId] -> SearchBranch -> SM SearchBranch
+updateBranchCost costFn comp = updateBranch' $ Just (costFn, comp)
+
+assignMeta :: MetaId -> Term -> Type -> SM [MetaId]
+assignMeta metaId term metaType =
+  metasCreatedBy (do
+    metaVar <- lookupLocalMeta metaId
+    metaArgs <- getMetaContextArgs metaVar
+    mlog $ "assignMeta: assigning " ++ prettyShow term ++ " to " ++ prettyShow metaId
+    assignV DirLeq metaId metaArgs term (AsTermsOf metaType))
+    >>= \case
+    ((), newMetaStore) -> do
+      let newMetaIds = Map.keys (openMetas newMetaStore)
+      mlog $ "New metas created in assignMeta: " ++ prettyShow newMetaIds
+      return newMetaIds
 
 addBranchGoals :: [Goal] -> SearchBranch -> SearchBranch
 addBranchGoals goals branch = branch {sbGoals = goals ++ sbGoals branch}
 
 withBranchState :: SearchBranch -> SM a -> SM a
-withBranchState br ma = withEnv (sbTCEnv br) $ do
+withBranchState br ma = {- withEnv (sbTCEnv br) $ -} do
   putTC (sbTCState br)
   ma
+
+withBranchAndGoal :: SearchBranch -> Goal -> SM a -> SM a
+withBranchAndGoal br goal ma = withEnv (goalEnv goal) (withBranchState br ma)
 
 nextBranchMeta' :: SearchBranch -> SM (Goal, SearchBranch)
 nextBranchMeta' = fmap (fromMaybe __IMPOSSIBLE__) . nextBranchMeta
@@ -862,6 +965,7 @@ getMetaInstantiation metaId = do
       res <- Just <$> (reify =<< {- etaContract' =<< -} instantiateFull (instBody inst))
       return res
     _ -> return Nothing
+
 
 getEverythingInScope :: MonadTCM tcm => MetaVariable -> tcm [QName]
 getEverythingInScope metaVar = do
@@ -905,6 +1009,9 @@ concatUnzip xs = let (as, bs) = unzip xs in (concat as, concat bs)
 
 mlog :: Monad m => String -> m ()
 mlog str = doLog str $ return ()
+
+mlog' :: Monad m => String -> m ()
+mlog' str = doLog str $ return ()
 
 doLog :: String -> a -> a
 doLog str e = unsafePerformIO $ do
@@ -953,13 +1060,13 @@ openMetasInTerm = filterM isMetaIdOpen . metasInTerm
 -- getContextArgs :: (Applicative m, MonadTCEnv m) => m Args
 -- getContextTelescope :: (Applicative m, MonadTCEnv m) => m Telescope
 -- getContextTerms :: (Applicative m, MonadTCEnv m) => m [Term]
-getLocalVars :: MonadTCM tcm => tcm [(Term, Type)]
+getLocalVars :: MonadTCM tcm => tcm [Component]
 getLocalVars = do
   contextTerms <- getContextTerms
   contextTypes <- map unDom . flattenTel <$> getContextTelescope
   unless (length contextTerms == length contextTypes)
          (mlog $ "WARNING: length mismatch in getLocalVars: " ++ prettyShow contextTerms ++ "; " ++ prettyShow contextTypes)
-  return $ zip contextTerms contextTypes
+  return $ zipWith (mkComponent Nothing) contextTerms contextTypes
 
 prettyBranch :: SearchBranch -> SM String
 prettyBranch branch = withBranchState branch $ do
@@ -967,7 +1074,8 @@ prettyBranch branch = withBranchState branch $ do
     metaId <- asks searchTopMeta
     inst <- getMetaInstantiation metaId
     instStr <- prettyTCM inst
-    return $ render $ text "Branch{metas: " <> metas <> text " , instantiation: " <> pretty metaId <> text " = " <> instStr <> text "}"
+    let compUses = pretty $ Map.toList $ sbComponentsUsed branch
+    return $ render $ text "Branch{cost: " <> text (show $ sbCost branch) <> ", metas: " <> metas <> text " , instantiation: " <> pretty metaId <> text " = " <> instStr <> text ", used components: " <> compUses <> text "}"
 
 prettySearchStepResult :: SearchStepResult -> SM String
 prettySearchStepResult = \case
@@ -1009,9 +1117,42 @@ data SearchOptions = SearchOptions
   { searchComponents :: Components
   , searchTopMeta :: MetaId
   , searchTopEnv :: TCEnv
+  , searchCosts :: Costs
   }
 
+
+data Costs = Costs
+  { costLocal :: Int
+  , costFn :: Int
+  , costDataCon :: Int
+  , costRecordCon :: Int
+  , costSpeculateProj :: Int
+  , costProj :: Int
+  , costLet :: Int
+  , costLevel :: Int
+  , costSet :: Int -- Should probably be replaced with multiple different costs
+  }
+
+noCost :: Int
+noCost = 0
+
+defaultCosts :: Costs
+defaultCosts = Costs
+  { costLocal = 1
+  , costFn = 3
+  , costDataCon = 1
+  , costRecordCon = 2
+  , costSpeculateProj = 2
+  , costProj = 2
+  , costLet = 1
+  , costLevel = 2
+  , costSet = 2
+  }
+
+
+
 type SM a = ReaderT SearchOptions TCM a
+
 
 -- TODO: Maybe there should be an instance @MonadTCM m => MonadMetaSolver m@?
 instance MonadMetaSolver (ReaderT r TCM) where
@@ -1029,16 +1170,6 @@ instance MonadMetaSolver (ReaderT r TCM) where
 isEmptyType :: Type -> SM Bool
 isEmptyType = liftTCM . Empty.isEmptyType
 
-
--- | Like etaOnce but only eta-contract lambdas (not records)
-etaContract' :: (MonadTCEnv m, HasConstInfo m, HasOptions m, TermLike a) => a -> m a
-etaContract' = traverseTermM etaOnce'
-
-etaOnce' :: (MonadTCEnv m, HasConstInfo m, HasOptions m) => Term -> m Term
-etaOnce' = \case
-  Lam i (Abs x b) -> etaLam i x b
-  v -> return v
-
 predNat :: Nat -> Nat
 predNat n | n > 0 = n - 1
           | n == 0 = 0
@@ -1048,3 +1179,9 @@ allOpenMetas :: (AllMetas t, ReadTCState tcm) => t -> tcm [MetaId]
 allOpenMetas t = do
   openMetas <- getOpenMetas
   return $ allMetas (:[]) t `intersect` openMetas
+
+
+instance Pretty Component where
+  pretty comp =
+    let name = case compName comp of Nothing -> text "NoName"; Just n -> pretty n
+    in text "Component{compName=" <> name <> ", compTerm=" <> pretty (compTerm comp) <> ", compType=" <> pretty (compType comp)
