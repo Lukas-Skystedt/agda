@@ -59,6 +59,7 @@ import Agda.TypeChecking.Level
 import {-# SOURCE #-} Agda.TypeChecking.Datatypes
 import Agda.TypeChecking.Free
 import Agda.TypeChecking.Substitute
+import Agda.TypeChecking.SyntacticEquality
 import Agda.TypeChecking.Telescope
 
 import Agda.Interaction.Options
@@ -433,190 +434,197 @@ reifyPathPConstAsPath x es = return (x,es)
 
 reifyTerm :: MonadReify m => Bool -> Term -> m Expr
 reifyTerm expandAnonDefs0 v0 = do
-  -- Jesper 2018-11-02: If 'PrintMetasBare', drop all meta eliminations.
-  metasBare <- asksTC envPrintMetasBare
-  v <- instantiate v0 >>= \case
-    I.MetaV x _ | metasBare -> return $ I.MetaV x []
-    v -> return v
-  -- Ulf 2014-07-10: Don't expand anonymous when display forms are disabled
-  -- (i.e. when we don't care about nice printing)
-  expandAnonDefs <- return expandAnonDefs0 `and2M` displayFormsEnabled
-  -- Andreas, 2016-07-21 if --postfix-projections
-  -- then we print system-generated projections as postfix, else prefix.
-  havePfp <- optPostfixProjections <$> pragmaOptions
-  let pred = if havePfp then (== ProjPrefix) else (/= ProjPostfix)
-  case unSpine' pred v of
-    -- Hack to print generalized field projections with nicer names. Should
-    -- only show up in errors. Check the spined form!
-    _ | I.Var n (I.Proj _ p : es) <- v,
-        Just name <- getGeneralizedFieldName p -> do
-      let fakeName = (qnameName p) {nameConcrete = C.simpleName name} -- TODO: infix names!?
-      elims (A.Var fakeName) =<< reify es
-    I.Var n es -> do
-      x <- fromMaybeM (freshName_ $ "@" ++ show n) $ nameOfBV' n
-      elims (A.Var x) =<< reify es
-    I.Def x es -> do
-      reportSDoc "reify.def" 80 $ return $ "reifying def" <+> pretty x
-      (x, es) <- reifyPathPConstAsPath x es
-      reifyDisplayForm x es $ reifyDef expandAnonDefs x es
-    I.Con c ci vs -> do
-      let x = conName c
-      isR <- isGeneratedRecordConstructor x
-      if isR || ci == ConORec
-        then do
-          showImp <- showImplicitArguments
-          let keep (a, v) = showImp || visible a
-          r <- getConstructorData x
-          xs <- fromMaybe __IMPOSSIBLE__ <$> getRecordFieldNames_ r
-          vs <- map unArg <$> reify (fromMaybe __IMPOSSIBLE__ $ allApplyElims vs)
-          return $ A.Rec noExprInfo $ map (Left . uncurry FieldAssignment . mapFst unDom) $ filter keep $ zip xs vs
-        else reifyDisplayForm x vs $ do
-          def <- getConstInfo x
-          let Constructor {conPars = np} = theDef def
-          -- if we are the the module that defines constructor x
-          -- then we have to drop at least the n module parameters
-          n <- getDefFreeVars x
-          -- the number of parameters is greater (if the data decl has
-          -- extra parameters) or equal (if not) to n
-          when (n > np) __IMPOSSIBLE__
-          let h = A.Con (unambiguous x)
-          if null vs
-            then return h
-            else do
-              es <- reify (map (fromMaybe __IMPOSSIBLE__ . isApplyElim) vs)
-              -- Andreas, 2012-04-20: do not reify parameter arguments of constructor
-              -- if the first regular constructor argument is hidden
-              -- we turn it into a named argument, in order to avoid confusion
-              -- with the parameter arguments which can be supplied in abstract syntax
-              --
-              -- Andreas, 2012-09-17: this does not remove all sources of confusion,
-              -- since parameters could have the same name as regular arguments
-              -- (see for example the parameter {i} to Data.Star.Star, which is also
-              -- the first argument to the cons).
-              -- @data Star {i}{I : Set i} ... where cons : {i :  I} ...@
-              if np == 0
-                then apps h es
+  -- letBindings :: [(Term, Name)]
+  letBindings <- mapM (\(name, openTypedTerm) -> (,name) . fst <$> getOpen openTypedTerm) =<< asksTC (Map.toAscList . envLetBindings)
+  matchingBindings <- filterM (\t -> checkSyntacticEquality v0 (fst t) (\_ _ -> return True) (\_ _ -> return False)) letBindings
+  case matchingBindings of
+    ((_v0, name):_) -> return $ A.Var name
+    [] -> do
+
+      -- Jesper 2018-11-02: If 'PrintMetasBare', drop all meta eliminations.
+      metasBare <- asksTC envPrintMetasBare
+      v <- instantiate v0 >>= \case
+        I.MetaV x _ | metasBare -> return $ I.MetaV x []
+        v -> return v
+      -- Ulf 2014-07-10: Don't expand anonymous when display forms are disabled
+      -- (i.e. when we don't care about nice printing)
+      expandAnonDefs <- return expandAnonDefs0 `and2M` displayFormsEnabled
+      -- Andreas, 2016-07-21 if --postfix-projections
+      -- then we print system-generated projections as postfix, else prefix.
+      havePfp <- optPostfixProjections <$> pragmaOptions
+      let pred = if havePfp then (== ProjPrefix) else (/= ProjPostfix)
+      case unSpine' pred v of
+        -- Hack to print generalized field projections with nicer names. Should
+        -- only show up in errors. Check the spined form!
+        _ | I.Var n (I.Proj _ p : es) <- v,
+            Just name <- getGeneralizedFieldName p -> do
+          let fakeName = (qnameName p) {nameConcrete = C.simpleName name} -- TODO: infix names!?
+          elims (A.Var fakeName) =<< reify es
+        I.Var n es -> do
+          x <- fromMaybeM (freshName_ $ "@" ++ show n) $ nameOfBV' n
+          elims (A.Var x) =<< reify es
+        I.Def x es -> do
+          reportSDoc "reify.def" 80 $ return $ "reifying def" <+> pretty x
+          (x, es) <- reifyPathPConstAsPath x es
+          reifyDisplayForm x es $ reifyDef expandAnonDefs x es
+        I.Con c ci vs -> do
+          let x = conName c
+          isR <- isGeneratedRecordConstructor x
+          if isR || ci == ConORec
+            then do
+              showImp <- showImplicitArguments
+              let keep (a, v) = showImp || visible a
+              r <- getConstructorData x
+              xs <- fromMaybe __IMPOSSIBLE__ <$> getRecordFieldNames_ r
+              vs <- map unArg <$> reify (fromMaybe __IMPOSSIBLE__ $ allApplyElims vs)
+              return $ A.Rec noExprInfo $ map (Left . uncurry FieldAssignment . mapFst unDom) $ filter keep $ zip xs vs
+            else reifyDisplayForm x vs $ do
+              def <- getConstInfo x
+              let Constructor {conPars = np} = theDef def
+              -- if we are the the module that defines constructor x
+              -- then we have to drop at least the n module parameters
+              n <- getDefFreeVars x
+              -- the number of parameters is greater (if the data decl has
+              -- extra parameters) or equal (if not) to n
+              when (n > np) __IMPOSSIBLE__
+              let h = A.Con (unambiguous x)
+              if null vs
+                then return h
                 else do
-                  -- Get name of first argument from type of constructor.
-                  -- Here, we need the reducing version of @telView@
-                  -- because target of constructor could be a definition
-                  -- expanding into a function type.  See test/succeed/NameFirstIfHidden.agda.
-                  TelV tel _ <- telView (defType def)
-                  let (pars, rest) = splitAt np $ telToList tel
-                  case rest of
-                    -- Andreas, 2012-09-18
-                    -- If the first regular constructor argument is hidden,
-                    -- we keep the parameters to avoid confusion.
-                    (Dom {domInfo = info} : _) | notVisible info -> do
-                      let us = for (drop n pars) $ \(Dom {domInfo = ai}) ->
-                            -- setRelevance Relevant $
-                            hideOrKeepInstance $ Arg ai underscore
-                      apps h $ us ++ es -- Note: unless --show-implicit, @apps@ will drop @us@.
-                    -- otherwise, we drop all parameters
-                    _ -> apps h es
+                  es <- reify (map (fromMaybe __IMPOSSIBLE__ . isApplyElim) vs)
+                  -- Andreas, 2012-04-20: do not reify parameter arguments of constructor
+                  -- if the first regular constructor argument is hidden
+                  -- we turn it into a named argument, in order to avoid confusion
+                  -- with the parameter arguments which can be supplied in abstract syntax
+                  --
+                  -- Andreas, 2012-09-17: this does not remove all sources of confusion,
+                  -- since parameters could have the same name as regular arguments
+                  -- (see for example the parameter {i} to Data.Star.Star, which is also
+                  -- the first argument to the cons).
+                  -- @data Star {i}{I : Set i} ... where cons : {i :  I} ...@
+                  if np == 0
+                    then apps h es
+                    else do
+                      -- Get name of first argument from type of constructor.
+                      -- Here, we need the reducing version of @telView@
+                      -- because target of constructor could be a definition
+                      -- expanding into a function type.  See test/succeed/NameFirstIfHidden.agda.
+                      TelV tel _ <- telView (defType def)
+                      let (pars, rest) = splitAt np $ telToList tel
+                      case rest of
+                        -- Andreas, 2012-09-18
+                        -- If the first regular constructor argument is hidden,
+                        -- we keep the parameters to avoid confusion.
+                        (Dom {domInfo = info} : _) | notVisible info -> do
+                          let us = for (drop n pars) $ \(Dom {domInfo = ai}) ->
+                                -- setRelevance Relevant $
+                                hideOrKeepInstance $ Arg ai underscore
+                          apps h $ us ++ es -- Note: unless --show-implicit, @apps@ will drop @us@.
+                        -- otherwise, we drop all parameters
+                        _ -> apps h es
 
---    I.Lam info b | isAbsurdBody b -> return $ A. AbsurdLam noExprInfo $ getHiding info
-    I.Lam info b    -> do
-      (x,e) <- reify b
-      -- #4160: Hacky solution: if --show-implicit, treat all lambdas as user-written. This will
-      -- prevent them from being dropped by AbstractToConcrete (where we don't have easy access to
-      -- the --show-implicit flag.
-      info <- ifM showImplicitArguments (return $ setOrigin UserWritten info) (return info)
-      return $ A.Lam exprNoRange (mkDomainFree $ unnamedArg info $ mkBinder_ x) e
-      -- Andreas, 2011-04-07 we do not need relevance information at internal Lambda
-    I.Lit l        -> reify l
-    I.Level l      -> reify l
-    I.Pi a b       -> case b of
-        NoAbs _ b'
-          | visible a   -> uncurry (A.Fun $ noExprInfo) <$> reify (a, b')
-            -- Andreas, 2013-11-11 Hidden/Instance I.Pi must be A.Pi
-            -- since (a) the syntax {A} -> B or {{A}} -> B is not legal
-            -- and (b) the name of the binder might matter.
-            -- See issue 951 (a) and 952 (b).
-          | otherwise   -> mkPi b =<< reify a
-        b               -> mkPi b =<< do
-          ifM (domainFree a (absBody b))
-            {- then -} (pure $ Arg (domInfo a) underscore)
-            {- else -} (reify a)
-      where
-        mkPi b (Arg info a') = do
-          tac <- traverse reify $ domTactic a
-          (x, b) <- reify b
-          let xs = singleton $ Arg info $ Named (domName a) $ mkBinder_ x
-          return $ A.Pi noExprInfo (singleton $ TBind noRange tac xs a') b
-        -- We can omit the domain type if it doesn't have any free variables
-        -- and it's mentioned in the target type.
-        domainFree a b = do
-          df <- asksTC envPrintDomainFreePi
-          return $ df && freeIn 0 b && closed a
+    --    I.Lam info b | isAbsurdBody b -> return $ A. AbsurdLam noExprInfo $ getHiding info
+        I.Lam info b    -> do
+          (x,e) <- reify b
+          -- #4160: Hacky solution: if --show-implicit, treat all lambdas as user-written. This will
+          -- prevent them from being dropped by AbstractToConcrete (where we don't have easy access to
+          -- the --show-implicit flag.
+          info <- ifM showImplicitArguments (return $ setOrigin UserWritten info) (return info)
+          return $ A.Lam exprNoRange (mkDomainFree $ unnamedArg info $ mkBinder_ x) e
+          -- Andreas, 2011-04-07 we do not need relevance information at internal Lambda
+        I.Lit l        -> reify l
+        I.Level l      -> reify l
+        I.Pi a b       -> case b of
+            NoAbs _ b'
+              | visible a   -> uncurry (A.Fun $ noExprInfo) <$> reify (a, b')
+                -- Andreas, 2013-11-11 Hidden/Instance I.Pi must be A.Pi
+                -- since (a) the syntax {A} -> B or {{A}} -> B is not legal
+                -- and (b) the name of the binder might matter.
+                -- See issue 951 (a) and 952 (b).
+              | otherwise   -> mkPi b =<< reify a
+            b               -> mkPi b =<< do
+              ifM (domainFree a (absBody b))
+                {- then -} (pure $ Arg (domInfo a) underscore)
+                {- else -} (reify a)
+          where
+            mkPi b (Arg info a') = do
+              tac <- traverse reify $ domTactic a
+              (x, b) <- reify b
+              let xs = singleton $ Arg info $ Named (domName a) $ mkBinder_ x
+              return $ A.Pi noExprInfo (singleton $ TBind noRange tac xs a') b
+            -- We can omit the domain type if it doesn't have any free variables
+            -- and it's mentioned in the target type.
+            domainFree a b = do
+              df <- asksTC envPrintDomainFreePi
+              return $ df && freeIn 0 b && closed a
 
-    I.Sort s     -> reify s
-    I.MetaV x es -> do
-          x' <- reify x
+        I.Sort s     -> reify s
+        I.MetaV x es -> do
+              x' <- reify x
 
-          es' <- reify es
+              es' <- reify es
 
-          mv <- lookupLocalMeta x
-          (msub1,meta_tel,msub2) <- do
-            local_chkpt <- viewTC eCurrentCheckpoint
-            (chkpt, tel, msub2) <- enterClosure mv $ \ _ ->
-                               (,,) <$> viewTC eCurrentCheckpoint
-                                    <*> getContextTelescope
-                                    <*> viewTC (eCheckpoints . key local_chkpt)
-            (,,) <$> viewTC (eCheckpoints . key chkpt) <*> pure tel <*> pure msub2
+              mv <- lookupLocalMeta x
+              (msub1,meta_tel,msub2) <- do
+                local_chkpt <- viewTC eCurrentCheckpoint
+                (chkpt, tel, msub2) <- enterClosure mv $ \ _ ->
+                                  (,,) <$> viewTC eCurrentCheckpoint
+                                        <*> getContextTelescope
+                                        <*> viewTC (eCheckpoints . key local_chkpt)
+                (,,) <$> viewTC (eCheckpoints . key chkpt) <*> pure tel <*> pure msub2
 
-          opt_show_ids <- showIdentitySubstitutions
-          let
-              addNames []    es = map (fmap unnamed) es
-              addNames _     [] = []
-              addNames xs     (I.Proj{} : _) = __IMPOSSIBLE__
-              addNames xs     (I.IApply x y r : es) =
-                -- Needs to be I.Apply so it can have an Origin field.
-                addNames xs (I.Apply (defaultArg r) : es)
-              addNames (x:xs) (I.Apply arg : es) =
-                I.Apply (Named (Just x) <$> (setOrigin Substitution arg)) : addNames xs es
+              opt_show_ids <- showIdentitySubstitutions
+              let
+                  addNames []    es = map (fmap unnamed) es
+                  addNames _     [] = []
+                  addNames xs     (I.Proj{} : _) = __IMPOSSIBLE__
+                  addNames xs     (I.IApply x y r : es) =
+                    -- Needs to be I.Apply so it can have an Origin field.
+                    addNames xs (I.Apply (defaultArg r) : es)
+                  addNames (x:xs) (I.Apply arg : es) =
+                    I.Apply (Named (Just x) <$> (setOrigin Substitution arg)) : addNames xs es
 
-              p = mvPermutation mv
-              applyPerm p vs = permute (takeP (size vs) p) vs
+                  p = mvPermutation mv
+                  applyPerm p vs = permute (takeP (size vs) p) vs
 
-              names = map (WithOrigin Inserted . unranged) $ p `applyPerm` teleNames meta_tel
-              named_es' = addNames names es'
+                  names = map (WithOrigin Inserted . unranged) $ p `applyPerm` teleNames meta_tel
+                  named_es' = addNames names es'
 
-              dropIdentitySubs sub_local2G sub_tel2G =
-                 let
-                     args_G = applySubst sub_tel2G $ p `applyPerm` (teleArgs meta_tel :: [Arg Term])
-                     es_G = sub_local2G `applySubst` es
-                     sameVar x (I.Apply y) = isJust xv && xv == deBruijnView (unArg y)
-                      where
-                       xv = deBruijnView $ unArg x
-                     sameVar _ _ = False
-                     dropArg = take (size names) $ zipWith sameVar args_G es_G
-                     doDrop (b : xs)  (e : es) = (if b then id else (e :)) $ doDrop xs es
-                     doDrop []        es = es
-                     doDrop _         [] = []
-                 in doDrop dropArg $ named_es'
+                  dropIdentitySubs sub_local2G sub_tel2G =
+                    let
+                        args_G = applySubst sub_tel2G $ p `applyPerm` (teleArgs meta_tel :: [Arg Term])
+                        es_G = sub_local2G `applySubst` es
+                        sameVar x (I.Apply y) = isJust xv && xv == deBruijnView (unArg y)
+                          where
+                          xv = deBruijnView $ unArg x
+                        sameVar _ _ = False
+                        dropArg = take (size names) $ zipWith sameVar args_G es_G
+                        doDrop (b : xs)  (e : es) = (if b then id else (e :)) $ doDrop xs es
+                        doDrop []        es = es
+                        doDrop _         [] = []
+                    in doDrop dropArg $ named_es'
 
-              simpl_named_es' | opt_show_ids                 = named_es'
-                              | Just sub_mtel2local <- msub1 = dropIdentitySubs IdS           sub_mtel2local
-                              | Just sub_local2mtel <- msub2 = dropIdentitySubs sub_local2mtel IdS
-                              | otherwise                    = named_es'
+                  simpl_named_es' | opt_show_ids                 = named_es'
+                                  | Just sub_mtel2local <- msub1 = dropIdentitySubs IdS           sub_mtel2local
+                                  | Just sub_local2mtel <- msub2 = dropIdentitySubs sub_local2mtel IdS
+                                  | otherwise                    = named_es'
 
-          nelims x' simpl_named_es'
+              nelims x' simpl_named_es'
 
-    I.DontCare v -> do
-      showIrr <- optShowIrrelevant <$> pragmaOptions
-      if | showIrr   -> reifyTerm expandAnonDefs v
-         | otherwise -> return underscore
-    I.Dummy s [] -> return $ A.Lit empty $ LitString (T.pack s)
-    I.Dummy "applyE" es | I.Apply (Arg _ h) : es' <- es -> do
-                            h <- reify h
-                            es' <- reify es'
-                            elims h es'
-                        | otherwise -> __IMPOSSIBLE__
-    I.Dummy s es -> do
-      s <- reify (I.Dummy s [])
-      es <- reify es
-      elims s es
+        I.DontCare v -> do
+          showIrr <- optShowIrrelevant <$> pragmaOptions
+          if | showIrr   -> reifyTerm expandAnonDefs v
+             | otherwise -> return underscore
+        I.Dummy s [] -> return $ A.Lit empty $ LitString (T.pack s)
+        I.Dummy "applyE" es | I.Apply (Arg _ h) : es' <- es -> do
+                                h <- reify h
+                                es' <- reify es'
+                                elims h es'
+                            | otherwise -> __IMPOSSIBLE__
+        I.Dummy s es -> do
+          s <- reify (I.Dummy s [])
+          es <- reify es
+          elims s es
   where
     -- Andreas, 2012-10-20  expand a copy if not in scope
     -- to improve error messages.

@@ -1008,7 +1008,7 @@ concatUnzip xs = let (as, bs) = unzip xs in (concat as, concat bs)
 
 
 mlog :: Monad m => String -> m ()
-mlog str = doLog str $ return ()
+mlog str = return () -- doLog str $ return ()
 
 mlog' :: Monad m => String -> m ()
 mlog' str = doLog str $ return ()
