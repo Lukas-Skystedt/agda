@@ -369,6 +369,7 @@ library
                     Agda.Interaction.Options.Warnings
                     Agda.Main
                     Agda.Mimer.Mimer
+                    Agda.Mimer.Options
                     Agda.Syntax.Abstract.Name
                     Agda.Syntax.Abstract.Pattern
                     Agda.Syntax.Abstract.PatternSynonyms

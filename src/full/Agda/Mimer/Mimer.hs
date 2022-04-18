@@ -25,7 +25,7 @@ import Data.PQueue.Min (MinQueue)
 import Agda.Compiler.Backend (getMetaContextArgs, TCState(..), PostScopeState(..), Open(..), isOpenMeta, getContextTerms)
 import Agda.Interaction.Base
 import Agda.Interaction.Base (Rewrite(..))
-import Agda.Interaction.BasicOps (typeOfMetaMI, contextOfMeta )
+import Agda.Interaction.BasicOps (typeOfMetaMI, contextOfMeta, parseExprIn)
 import Agda.Interaction.Response (ResponseContextEntry(..))
 import Agda.Syntax.Abstract (Expr(AbsurdLam))
 import Agda.Syntax.Abstract.Name (QName(..), Name(..))
@@ -67,7 +67,9 @@ import qualified Agda.TypeChecking.Monad.Base as TCM
 import Debug.Trace
 import System.IO.Unsafe (unsafePerformIO)
 import Control.Monad.IO.Class (liftIO)
-
+import qualified Agda.Auto.Options as Opt
+import qualified Agda.Auto.Auto as Auto
+import Agda.Mimer.Options
 newtype MimerResult = MimerResult String
 
 
@@ -76,9 +78,12 @@ mimer :: MonadTCM tcm
   -> Range
   -> String
   -> tcm MimerResult
-mimer ii range hint = liftTCM $  do
+mimer ii range argStr = liftTCM $  do
+    opts <- parseOptions ii range argStr
+    mlog $ show opts
+
     oldState <- getTC
-    sols <- runBfs True ii
+    sols <- runBfs opts True ii
     putTC oldState
     -- The meta variable to solve
     -- metaI <- lookupInteractionId ii
@@ -441,8 +446,8 @@ data SearchStepResult
   | OpenBranch SearchBranch
   | NoSolution
 
-runBfs :: Bool -> InteractionId -> TCM [String]
-runBfs stopAfterFirst ii = withInteractionId ii $ do
+runBfs :: Options -> Bool -> InteractionId -> TCM [String]
+runBfs options stopAfterFirst ii = withInteractionId ii $ do
   mTheFunctionQName <- fmap ipClause (lookupInteractionPoint ii) <&> \case
     clause@IPClause{} -> Just $ ipcQName clause
     IPNoClause -> Nothing
@@ -460,7 +465,7 @@ runBfs stopAfterFirst ii = withInteractionId ii $ do
 
   state <- getTC
   env <- askTC
-  components <- collectComponents mTheFunctionQName metaId
+  components <- collectComponents options mTheFunctionQName metaId
 
 
   -- TODO: What if metaIds is empty? (The whole thing was solved by unification)
@@ -487,22 +492,25 @@ runBfs stopAfterFirst ii = withInteractionId ii $ do
             , sbComponentsUsed = Map.empty
             }
 
-      let options = SearchOptions { searchComponents = components
-                                  , searchTopMeta = metaId
-                                  , searchTopEnv = env
-                                  , searchCosts = defaultCosts
-                                  }
-      flip runReaderT options $ do
+      let searchOptions = SearchOptions
+            { searchComponents = components
+            , searchHintMode = optHintMode options
+            , searchTimeout = optTimeout options
+            , searchTopMeta = metaId
+            , searchTopEnv = env
+            , searchCosts = defaultCosts
+            }
+      flip runReaderT searchOptions $ do
         mlog $ "Components: " ++ prettyShow components
         mlog =<< ("startBranch: " ++) <$> prettyBranch startBranch
-
+        timeout <- secondsToNominalDiffTime . (/1000) . fromIntegral <$> asks searchTimeout
         startTime <- liftIO $ getCurrentTime
         let go n allBranches = case Q.minView allBranches of
               Nothing -> return ([], n)
               Just (branch, branches) -> do
                 time <- liftIO $ getCurrentTime
 
-                if diffUTCTime time startTime < secondsToNominalDiffTime 30
+                if diffUTCTime time startTime < timeout
                 then do
                   (branches', sols) <- partitionStepResult branches <$> bfsRefine branch
                   mlog $ replicate 30 '#' ++ show n ++ replicate 30 '#'
@@ -538,8 +546,8 @@ getLetVars = asksTC envLetBindings >>= mapM bindingToComp . Map.toAscList
 
 
 collectComponents :: (MonadTCM tcm, ReadTCState tcm, HasConstInfo tcm, MonadFresh NameId tcm, MonadInteractionPoints tcm, MonadStConcreteNames tcm, PureTCM tcm)
-  => Maybe QName -> MetaId -> tcm Components
-collectComponents mDefName metaId = do
+  => Options -> Maybe QName -> MetaId -> tcm Components
+collectComponents opts mDefName metaId = do
   let components = Components
         { hintFns = []
         , hintDataTypes = []
@@ -562,6 +570,8 @@ collectComponents mDefName metaId = do
     , hintWhere = doSort $ hintWhere components'
     }
   where
+    hintMode = optHintMode opts
+    explicitHints = optExplicitHints opts
     -- Sort by the arity of the type
     doSort = sortOn (arity . compType)
 
@@ -587,7 +597,7 @@ collectComponents mDefName metaId = do
         f@Function{}
           | isToLevel typ && isNotMutual qname f
             -> return comps{hintLevel = mkComponentQ qname (Def qname []) typ : hintLevel comps}
-          | isNotMutual qname f
+          | isNotMutual qname f && (hintMode /= NoHints || qname `elem` explicitHints) -- TODO: Check if local to module or not
             -> return comps{hintFns = mkComponentQ qname (Def qname []) typ : hintFns comps}
           | otherwise -> return comps
         Datatype{} -> return comps{hintDataTypes = mkComponentQ qname (Def qname []) typ : hintDataTypes comps}
@@ -1008,7 +1018,7 @@ concatUnzip xs = let (as, bs) = unzip xs in (concat as, concat bs)
 
 
 mlog :: Monad m => String -> m ()
-mlog str = return () -- doLog str $ return ()
+mlog str = doLog str $ return ()
 
 mlog' :: Monad m => String -> m ()
 mlog' str = doLog str $ return ()
@@ -1115,6 +1125,8 @@ instance Pretty Components where
 
 data SearchOptions = SearchOptions
   { searchComponents :: Components
+  , searchHintMode :: HintMode
+  , searchTimeout :: MilliSeconds
   , searchTopMeta :: MetaId
   , searchTopEnv :: TCEnv
   , searchCosts :: Costs
@@ -1185,3 +1197,4 @@ instance Pretty Component where
   pretty comp =
     let name = case compName comp of Nothing -> text "NoName"; Just n -> pretty n
     in text "Component{compName=" <> name <> ", compTerm=" <> pretty (compTerm comp) <> ", compType=" <> pretty (compType comp)
+
