@@ -17,6 +17,8 @@ import Data.Maybe (isJust)
 import Data.Function (on)
 import qualified Data.IntSet as IntSet
 import Data.Function (on)
+import Control.DeepSeq (force, NFData(..))
+import GHC.Generics (Generic)
 
 import Data.Time.Clock (diffUTCTime, getCurrentTime, secondsToNominalDiffTime)
 import qualified Data.PQueue.Min as Q
@@ -54,13 +56,15 @@ import Agda.TypeChecking.Substitute.Class (apply)
 import Agda.TypeChecking.Telescope (piApplyM, flattenTel)
 import Agda.TypeChecking.Warnings (MonadWarning)
 import qualified Agda.TypeChecking.Empty as Empty -- (isEmptyType)
+import Agda.Utils.Benchmark (MonadBench(..), billTo)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Maybe (catMaybes)
+import Agda.Utils.Monad (unlessM)
 import Agda.Utils.Permutation (idP, permute, takeP)
 import Agda.Utils.Pretty (Pretty, prettyShow, render, pretty, braces, prettyList_)
-import Agda.Utils.Tuple (mapFst, mapSnd)
-import Agda.Utils.Monad (unlessM)
 import Agda.Utils.Pretty (text)
+import Agda.Utils.Tuple (mapFst, mapSnd)
+import qualified Agda.Benchmarking as Bench
 import qualified Agda.Syntax.Scope.Base as Scope
 import qualified Agda.TypeChecking.Monad.Base as TCM
 
@@ -78,7 +82,7 @@ mimer :: MonadTCM tcm
   -> Range
   -> String
   -> tcm MimerResult
-mimer ii range argStr = liftTCM $  do
+mimer ii range argStr = liftTCM $ do
     opts <- parseOptions ii range argStr
     mlog $ show opts
 
@@ -113,75 +117,6 @@ mimer ii range argStr = liftTCM $  do
 type TypedTerm = (Term, Type)
 
 
--- TODO: withInteractionId to get the right context
-runDfs :: InteractionId -> TCM (Maybe Expr)
-runDfs ii = withInteractionId ii $ do
-  theFunctionQName <- ipcQName . ipClause <$> lookupInteractionPoint ii
-  mlog $ "Interaction point inside: " ++ prettyShow theFunctionQName
-  -- TODO: What normalization should we use here?
-  -- TODO: The problem with `contextOfMeta` is that it gives `Expr`. However, it does include let-bindings.
-  context <- contextOfMeta ii AsIs
-  strs <- mapM (\entry -> showTCM (respType entry) >>= \s -> return $ prettyShow (respOrigName entry) ++ " : " ++ s) context
-  mlog $ "contextOfMeta: " ++ intercalate ", " strs
-
-  context' <- getContext
-  mlog $ "getContext: " ++ prettyShow context'
-
-  localVars <- getLocalVars
-  mlog $ "getLocalVars: " ++ prettyShow localVars
-
-  -- TODO: Handle the `Open` stuff
-  letVars <- asksTC envLetBindings >>= mapM (fmap (mapSnd unDom) . getOpen . snd) . Map.toAscList
-  mlog $ "let-bound vars: " ++ prettyShow letVars
-
-
-  metaId <- lookupInteractionId ii
-  metaVar <- lookupLocalMeta metaId
-  metaArgs <- getMetaContextArgs metaVar
-  mlog $ "getMetaContextArgs: " ++ prettyShow metaArgs
-
-
-  -- We remove the name of the function the interaction point occurs in to prevent
-  -- arbitrary recursive calls
-  hintNames1 <- filter (/= theFunctionQName) <$> getEverythingInScope metaVar
-  records <- filterM (fmap isJust . isRecord) hintNames1
-  recordProjs <- concat  <$> mapM getRecordFields records
-  let hintNames = hintNames1 ++ recordProjs
-  hints <- sortOn (arity . snd) . catMaybes <$> mapM qnameToTerm hintNames
-  let hints' = filter (\(d,_) -> case d of Def{} -> True; _ -> False) hints
-  mlog $ "Using hints: " ++ prettyShow (map fst hints')
-  -- TODO: Remove @letVars ++@
-  resTerm <- dfs (letVars ++ hints') 4 metaId
-
-  mlog $ "dfs result term: " ++ prettyShow resTerm
-
-  metaVar' <- lookupLocalMeta metaId
-  case mvInstantiation metaVar' of
-    InstV inst -> do
-      termStr <- showTCM (instBody inst)
-      mlog $ "instantiated to (showTCM):  " ++ termStr
-      termStrNorm <- showTCM =<< normalise (instBody inst)
-      mlog $ "instantiated (nf):  " ++ termStrNorm
-      debugRecord (instBody inst)
-      Just <$> reify (instBody inst)
-    _ -> return Nothing
-  where
-    debugRecord = \case
-      Con ch ci es -> do
-        mlog $ "instantiation is a con: " ++ prettyShow ch ++ " " ++ show ci ++ " " ++ prettyShow es
-        let s e = case e of
-                    Apply arg -> case unArg arg of
-                      MetaV m _ -> do
-                        mv <- lookupLocalMeta m
-                        case mvInstantiation mv of
-                          InstV inst' -> ((prettyShow m ++ "=") ++) <$> showTCM (instBody inst')
-                          _ -> return ""
-                      _ -> return ""
-                    _ -> return ""
-        mapM s es >>= \str -> mlog $ "  where " ++ unwords str
-
-      _ -> return ()
-
 getRecordFields :: (HasConstInfo tcm, MonadTCM tcm) => QName -> tcm [QName]
 getRecordFields = fmap (map unDom . recFields . theDef) . getConstInfo
 
@@ -207,165 +142,6 @@ qnameToTerm qname = do
 qnameToComp :: (MonadTCM tcm, HasConstInfo tcm, ReadTCState tcm) => QName -> tcm (Maybe Component)
 qnameToComp qname = fmap (uncurry $ mkComponentQ qname) <$> qnameToTerm qname
 
--- TODO: Check how giveExpr (intercation basic ops) -- v' <- instantiate $ MetaV mi $ map Apply ctx
-dfs :: [(Term, Type)] -> Int -> MetaId -> TCM (Maybe Term)
-dfs hints depth metaId = do
-  metaVar <- lookupLocalMeta metaId
-  -- Check if meta is already instantiated
-  case mvInstantiation metaVar of
-    InstV inst -> do
-      mlog $ "dfs: meta " ++ prettyShow metaId ++ " already instantiated to " ++ prettyShow (instBody inst)
-      return $ Just $ instBody inst
-    -- Meta not instantiated, check if max depth is reached
-    _ | depth <= 0 -> return Nothing
-      -- Max depth not reached, continue search
-      | otherwise -> do
-          metaType <- reduce =<< getMetaTypeInContext metaId
-          localVars <- map (\c -> (compTerm c, compType c)) <$> getLocalVars
-          go localVars
-            `elseTry` tryDataCon hints depth metaId
-            `elseTry` go hints
-            `elseTry` tryLambda hints depth metaId
-  where
-    go [] = return Nothing
-    go ((hintTerm, hintType):hs) = do
-      mTerm <- tryRefine hints depth metaId hintTerm hintType
-      case mTerm of
-        Just term -> return $ Just term
-        Nothing -> go hs
-
-tryDataCon :: [(Term, Type)] -> Int -> MetaId -> TCM (Maybe Term)
-tryDataCon hints depth metaId = do
-  nonReducedMetaType <- getMetaTypeInContext metaId
-  metaType <- reduce nonReducedMetaType
-  case unEl metaType of
-    Def qname elims -> isDataOrRecordType qname >>= \case
-      Just IsData -> do
-        info <- getConstInfo qname
-        case theDef info of
-          dataDefn@Datatype{} -> (fmap sequence $ mapM qnameToTerm $ dataCons dataDefn) >>= \case
-            Nothing -> error ""
-            Just cs ->
-              let go [] = return Nothing
-                  go ((term,typ):cs') = tryRefine hints depth metaId term typ `elseTry` go cs'
-              in go (sortOn (arity . snd) cs) -- Try the constructors with few arguments first
-          _ -> __IMPOSSIBLE__ -- return Nothing
-      -- TODO: pattern/copattern
-      Just IsRecord{} -> do
-        info <- getConstInfo qname
-        case theDef info of
-          -- TODO: is ConORec appropriate?
-          -- TODO: There is a `getRecordConstructor` function
-          -- TODO: instantiate the hint term with meta variables for the fields
-          recordDefn@Record{} -> do
-            let cHead = recConHead recordDefn
-                cName = conName cHead
-                hintTerm = Con cHead ConORec []
-            typ <- typeOfConst cName
-            tryRefine hints depth metaId hintTerm typ
-          _ -> __IMPOSSIBLE__ -- return Nothing
-      _ -> return Nothing
-    _ -> return Nothing
-
-
--- TODO: for adding binders: addToContext
--- TODO: Break out the part where we lookup the meta type etc.
-tryRefine :: [(Term, Type)] -> Int -> MetaId -> Term -> Type -> TCM (Maybe Term)
-tryRefine hints depth metaId hintTerm hintTyp = do
-  metaVar <- lookupLocalMeta metaId
-  metaType <- getMetaTypeInContext metaId
-  metaArgs <- getMetaContextArgs metaVar
-  go metaType metaArgs hintTerm hintTyp
-  where
-    go :: Type -> Args -> Term -> Type -> TCM (Maybe Term)
-    go metaType metaArgs term nonreducedTyp = do
-      typ <- reduce nonreducedTyp
-      mlog $ "Trying " ++ prettyShow term ++ " : " ++ prettyShow typ ++ " to solve meta of type " ++ prettyShow metaType
-      oldState <- getTC -- TODO: Backtracking state
-      metasCreatedBy (dumbUnifier typ metaType) >>= \case
-        -- The hint is applicable
-        (True, newMetaStore) -> do
-          let newMetaIds = Map.keys (openMetas newMetaStore)
-          mlog $ "unifier succeeded, creating new metas: " ++ prettyShow newMetaIds ++ ".  Assigning " ++ prettyShow term ++ " to " ++ prettyShow metaId
-          -- Solve any metas created during unification
-          sequence <$> mapM (dfs hints (depth - 1)) newMetaIds >>= \case
-            Just terms -> do
-              assignV DirLeq metaId metaArgs term (AsTermsOf metaType)
-              return $ Just term
-            Nothing -> do
-              putTC oldState
-              return Nothing
-        (False, _) -> case unEl typ of
-          -- The hint may be applicable if we apply it to more metas
-          Pi dom abs -> do
-              putTC oldState
-              let domainType = unDom dom
-              -- TODO: What exactly does the occur check do?
-              (metaId', metaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq domainType
-              mlog $ "Created new meta: " ++ prettyShow metaId'
-              let arg = setOrigin Inserted $ metaTerm <$ argFromDom dom
-              newType <- piApplyM typ metaTerm
-              let newTerm = apply term [arg]
-              go metaType metaArgs newTerm newType >>= \case
-                Nothing -> do
-                  putTC oldState
-                  return Nothing
-                -- Refinement success using the new meta as an argument
-                Just resTerm -> do
-                  mlog $ "Succeeded to find a matching term, solving remaining sub-meta: " ++ prettyShow metaId'
-                  mSub <- dfs hints (depth - 1) metaId'
-                  case mSub of
-                    Just subTerm -> return $ Just resTerm
-                    Nothing -> do
-                      putTC oldState
-                      return Nothing
-          -- The hint is not applicable
-          _ -> return Nothing
--- Termination checking:
--- Build call graph
--- Every cycle must have a "shrinking" arg
-
-tryLambda :: [(Term, Type)] -> Int -> MetaId -> TCM (Maybe Term)
-tryLambda hints depth metaId = do
-  oldState <- getTC
-  metaVar <- lookupLocalMeta metaId
-  metaArgs <- getMetaContextArgs metaVar
-  nonReducedMetaType <- getMetaTypeInContext metaId
-  metaType <- reduce nonReducedMetaType
-  -- TODO: check out `ifPi` or `ifPiType`
-  case unEl metaType of
-    Pi dom abs -> do
-      -- TODO: look at `suggests`
-      let bindName = absName abs
-      newName <- freshName_ bindName
-      mlog $ "Trying lambda with bindName " ++ prettyShow newName ++ " (generated from absName " ++ prettyShow (absName abs) ++ ")"
-      -- TODO: `lambdaAddContext` vs `addContext`
-      mSub <- lambdaAddContext newName bindName dom $ do
-        context <- getContext
-        mlog $ "  context inside lambda: " ++ prettyShow context
-
-        -- TODO: due to problem with shifting indices, we lookup the type of the meta again in the extended context
-        metaType' <- getMetaTypeInContext metaId
-        bodyTyp <- piApplyM metaType' (Var 0 [])
-        mlog $ "  body type inside lambda: " ++ prettyShow bodyTyp
-        (metaId', metaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq bodyTyp
-        dfs hints (depth - 1) metaId'
-      case mSub of
-        Just body -> do
-          let argInf = domInfo dom -- TODO: is this the correct arg info?
-              newAbs = Abs{absName = bindName, unAbs = body}
-              term = (Lam argInf newAbs)
-          mlog $ "Lambda succeeded. Assigning " ++ prettyShow term ++ " to " ++ prettyShow metaId
-          assignV DirLeq metaId metaArgs term (AsTermsOf metaType)
-          return $ Just term
-        Nothing -> do
-          mlog "Lambda failed."
-          putTC oldState
-          return Nothing
-    _ -> do
-      putTC oldState
-      return Nothing
-
 
 data SearchBranch = SearchBranch
   { sbTCState :: TCState
@@ -374,6 +150,8 @@ data SearchBranch = SearchBranch
   , sbCost :: Int
   , sbComponentsUsed :: Map Name Int -- ^ Number of times each component has been used
   }
+  deriving (Generic)
+instance NFData SearchBranch
 
 -- | NOTE: Equality is only on the field `sbCost`
 instance Eq SearchBranch where
@@ -389,6 +167,8 @@ data Goal = Goal
   , goalLocalVars :: Maybe [Component]
   , goalEnv :: TCEnv
   }
+  deriving (Generic)
+instance NFData Goal
 
 -- TODO: Is this a reasonable Eq instance?
 instance Eq Goal where
@@ -427,9 +207,13 @@ data Components = Components
   -- ^ A definition in a where clause
   , hintProjections :: [Component]
   }
+  deriving (Generic)
+instance NFData Components
 
 data Component = Component {compTerm :: Term, compType :: Type, compName :: Maybe Name}
-  deriving Eq
+  deriving (Eq, Generic)
+
+instance NFData Component
 
 mkComponent :: Maybe Name -> Term -> Type -> Component
 mkComponent name term typ = Component { compTerm = term, compType = typ, compName = name}
@@ -445,6 +229,8 @@ data SearchStepResult
   = ResultExpr Expr
   | OpenBranch SearchBranch
   | NoSolution
+  deriving (Generic)
+instance NFData SearchStepResult
 
 runBfs :: Options -> Bool -> InteractionId -> TCM [String]
 runBfs options stopAfterFirst ii = withInteractionId ii $ do
@@ -500,7 +286,7 @@ runBfs options stopAfterFirst ii = withInteractionId ii $ do
             , searchTopEnv = env
             , searchCosts = defaultCosts
             }
-      flip runReaderT searchOptions $ do
+      flip runReaderT searchOptions $ bench [Bench.Deserialization] $ do
         mlog $ "Components: " ++ prettyShow components
         -- mlog =<< ("startBranch: " ++) <$> prettyBranch startBranch
         timeout <- secondsToNominalDiffTime . (/1000) . fromIntegral <$> asks searchTimeout
@@ -631,7 +417,7 @@ bfsRefine :: SearchBranch -> SM [SearchStepResult]
 bfsRefine branch = withBranchState branch $ do
   (goal, branch') <- nextBranchMeta' branch
   withBranchAndGoal branch' goal $ do
-    goalType <- reduce =<< getMetaTypeInContext (goalMeta goal)
+    goalType <- bench [Bench.Deserialization, Bench.Reduce] $ reduce =<< getMetaTypeInContext (goalMeta goal)
     -- Lambda-abstract as far as possible
     bfsLambdaAbstract goal goalType branch' >>= \case
       -- Abstracted with absurd pattern: solution found.
@@ -690,8 +476,8 @@ bfsLambdaAbstract goal goalType branch =
         newName <- freshName_ bindName
         (metaId', bodyType, metaTerm, env) <- lambdaAddContext newName bindName dom $ do
           goalType' <- getMetaTypeInContext (goalMeta goal)
-          bodyType <- reduce =<< piApplyM goalType' (Var 0 []) -- TODO: Good place to reduce?
-          (metaId', metaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq bodyType
+          bodyType <- bench [Bench.Deserialization, Bench.Reduce] $ reduce =<< piApplyM goalType' (Var 0 []) -- TODO: Good place to reduce?
+          (metaId', metaTerm) <- bench [Bench.Deserialization, Bench.Free] $ newValueMeta DontRunMetaOccursCheck CmpLeq bodyType
           mlog $ "Created meta " ++ prettyShow metaId' ++ " in bfsLambdaAbstract"
           env <- askTC
 
@@ -718,7 +504,7 @@ bfsLambdaAbstract goal goalType branch =
 bfsLocals :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
 bfsLocals goal goalType branch = withBranchAndGoal branch goal $ do
   metaVar <- lookupLocalMeta (goalMeta goal)
-  localVars <- getLocalVars
+  localVars <- bench [Bench.Deserialization, Bench.Level] $ getLocalVars
   -- TODO: Explain permute
   let localVars' = localVars -- permute (takeP (length localVars) $ mvPermutation metaVar) localVars
   newBranches <- catMaybes <$> mapM (bfsTryRefineAddMetas costLocal goal goalType branch) localVars'
@@ -804,7 +590,7 @@ bfsDataRecord goal goalType branch = withBranchAndGoal branch goal $ do
     -- TODO: Add an extra filtering on the sort
     bfsSet :: Level -> SM [SearchStepResult]
     bfsSet level = do
-      setTerm <- reduce level >>= \case
+      setTerm <- bench [Bench.Deserialization, Bench.Reduce] $ reduce level >>= \case
         reducedLevel@(Max i [])
           | i > 0 -> return [mkComponent Nothing (Sort $ Type $ Max (i-1) []) goalType]
           | otherwise -> do
@@ -822,7 +608,7 @@ bfsDataRecord goal goalType branch = withBranchAndGoal branch goal $ do
       mapM checkSolved newBranches
 
 checkSolved :: SearchBranch -> SM SearchStepResult
-checkSolved branch = {-# SCC "custom-checkSolved" #-} do
+checkSolved branch = {-# SCC "custom-checkSolved" #-} bench [Bench.Deserialization, Bench.Sort] $ do
   env <- asks searchTopEnv
   withBranchState branch $ withEnv env $ do
     openMetas <- getOpenMetas
@@ -874,24 +660,27 @@ bfsTryRefineAddMetas costFn = bfsTryRefineAddMetasSkip costFn 0
 -- TODO: Rewrite with Component?
 -- NOTE: The new metas are in left-to-right order -- the opposite of the
 -- order they should be solved in.
-applyToMetas :: Nat -> Term -> Type -> SM (Term, Type, [MetaId])
-applyToMetas skip term typ = do
+applyToMetas' :: Nat -> Term -> Type -> SM (Term, Type, [MetaId])
+applyToMetas' skip term typ = do
   ctx <- getContextTelescope
   mlog $ prettyShow ctx
   case unEl typ of
     Pi dom abs -> do
       let domainType = unDom dom
       -- TODO: What exactly does the occur check do?
-      (metaId', metaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq domainType
+      (metaId', metaTerm) <- bench [Bench.Deserialization, Bench.Free] $ newValueMeta DontRunMetaOccursCheck CmpLeq domainType
       mlog $ "Created meta " ++ prettyShow metaId' ++ " in applyToMetas"
       let arg = setOrigin Inserted $ metaTerm <$ argFromDom dom
-      newType <- reduce =<< piApplyM typ metaTerm -- TODO: Is this the best place to reduce?
+      newType <- bench [Bench.Deserialization, Bench.Reduce] $ reduce =<< piApplyM typ metaTerm -- TODO: Is this the best place to reduce?
       -- For records, the parameters are not included in the term
       let newTerm = if skip > 0 then term else apply term [arg]
-      (term', typ', metas) <- applyToMetas (predNat skip) newTerm newType
+      (term', typ', metas) <- applyToMetas' (predNat skip) newTerm newType
       return (term', typ', metaId' : metas)
     _ -> return (term, typ, [])
 
+-- TODO: Remove this version (it is just for bench-marking)
+applyToMetas :: Nat -> Term -> Type -> SM (Term, Type, [MetaId])
+applyToMetas skip term typ = bench [Bench.Deserialization, Bench.Generalize] $ applyToMetas' skip term typ
 
 updateBranch' :: Maybe (Costs -> Int, Component) -> [MetaId] -> SearchBranch -> SM SearchBranch
 updateBranch' costs newMetaIds branch = do
@@ -923,7 +712,7 @@ updateBranchCost :: (Costs -> Int) -> Component -> [MetaId] -> SearchBranch -> S
 updateBranchCost costFn comp = updateBranch' $ Just (costFn, comp)
 
 assignMeta :: MetaId -> Term -> Type -> SM [MetaId]
-assignMeta metaId term metaType = {-# SCC "custom-assignMeta" #-}
+assignMeta metaId term metaType = bench [Bench.Deserialization, Bench.CheckRHS] $ {-# SCC "custom-assignMeta" #-}
   metasCreatedBy (do
     metaVar <- lookupLocalMeta metaId
     metaArgs <- getMetaContextArgs metaVar
@@ -992,9 +781,10 @@ getEverythingInScope metaVar = do
 
   -- TODO: Look at getContextVars, locallyTC, getMetaScope
 
-dumbUnifier :: (MonadTCM tcm, PureTCM tcm, MonadWarning tcm, MonadStatistics tcm, MonadMetaSolver tcm, MonadFresh Int tcm, MonadFresh ProblemId tcm)
-  => Type -> Type -> tcm Bool
-dumbUnifier t1 t2 = {-# SCC "custom-dumbUnifier" #-}
+-- dumbUnifier :: (MonadTCM tcm, PureTCM tcm, MonadWarning tcm, MonadStatistics tcm, MonadMetaSolver tcm, MonadFresh Int tcm, MonadFresh ProblemId tcm)
+--   => Type -> Type -> tcm Bool
+dumbUnifier :: Type -> Type -> SM Bool
+dumbUnifier t1 t2 = bench [Bench.Deserialization, Bench.UnifyIndices] $ {-# SCC "custom-dumbUnifier" #-}
   (noConstraints $ equalType t2 t1 >> return True) `catchError` \err -> do
 --     str <- showTCM err
 --     mlog $ "dumbUnifier error: " ++ str
@@ -1012,6 +802,11 @@ showTCM v = render <$> prettyTCM v
 
 concatUnzip :: [([a], [b])] -> ([a], [b])
 concatUnzip xs = let (as, bs) = unzip xs in (concat as, concat bs)
+
+bench :: NFData a => [Bench.Phase] -> SM a -> SM a
+bench k ma = billTo (Bench.Deserialization:k) ma
+  -- r <- ma
+  -- return $ force r
 
 -- partitionEithers :: [Either a b] -> ([a], [b])
 -- partitionEithers [] = ([], [])
