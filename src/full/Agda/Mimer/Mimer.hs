@@ -56,7 +56,7 @@ import Agda.TypeChecking.Warnings (MonadWarning)
 import qualified Agda.TypeChecking.Empty as Empty -- (isEmptyType)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Maybe (catMaybes)
-import Agda.Utils.Permutation (idP)
+import Agda.Utils.Permutation (idP, permute, takeP)
 import Agda.Utils.Pretty (Pretty, prettyShow, render, pretty, braces, prettyList_)
 import Agda.Utils.Tuple (mapFst, mapSnd)
 import Agda.Utils.Monad (unlessM)
@@ -502,8 +502,9 @@ runBfs options stopAfterFirst ii = withInteractionId ii $ do
             }
       flip runReaderT searchOptions $ do
         mlog $ "Components: " ++ prettyShow components
-        mlog =<< ("startBranch: " ++) <$> prettyBranch startBranch
+        -- mlog =<< ("startBranch: " ++) <$> prettyBranch startBranch
         timeout <- secondsToNominalDiffTime . (/1000) . fromIntegral <$> asks searchTimeout
+        mlog' $ "Timeout: " ++ show timeout
         startTime <- liftIO $ getCurrentTime
         let go n allBranches = case Q.minView allBranches of
               Nothing -> return ([], n)
@@ -513,10 +514,10 @@ runBfs options stopAfterFirst ii = withInteractionId ii $ do
                 if diffUTCTime time startTime < timeout
                 then do
                   (branches', sols) <- partitionStepResult branches <$> bfsRefine branch
-                  mlog $ replicate 30 '#' ++ show n ++ replicate 30 '#'
-                  mapM_ (mlog <=< showTCM) sols
-                  mlog =<< (unlines <$> mapM prettyBranch (Q.toList branches'))
-                  mlog (replicate 61 '#')
+                  -- mlog $ replicate 30 '#' ++ show n ++ replicate 30 '#'
+                  -- mapM_ (mlog <=< showTCM) sols
+                  -- mlog =<< (unlines <$> mapM prettyBranch (Q.toList branches'))
+                  -- mlog (replicate 61 '#')
                   if stopAfterFirst
                   then case sols of [] -> go (n+1) branches'; _ -> return (sols, n)
                   else mapFst (sols ++) <$> go (n+1) branches'
@@ -716,8 +717,11 @@ bfsLambdaAbstract goal goalType branch =
 -- | NOTE: the MetaId should already be removed from the SearchBranch when this function is called
 bfsLocals :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
 bfsLocals goal goalType branch = withBranchAndGoal branch goal $ do
+  metaVar <- lookupLocalMeta (goalMeta goal)
   localVars <- getLocalVars
-  newBranches <- catMaybes <$> mapM (bfsTryRefineAddMetas costLocal goal goalType branch) localVars
+  -- TODO: Explain permute
+  let localVars' = localVars -- permute (takeP (length localVars) $ mvPermutation metaVar) localVars
+  newBranches <- catMaybes <$> mapM (bfsTryRefineAddMetas costLocal goal goalType branch) localVars'
   mapM checkSolved newBranches
 
 -- TODO: Factor out `checkSolved`
@@ -818,7 +822,7 @@ bfsDataRecord goal goalType branch = withBranchAndGoal branch goal $ do
       mapM checkSolved newBranches
 
 checkSolved :: SearchBranch -> SM SearchStepResult
-checkSolved branch = do
+checkSolved branch = {-# SCC "custom-checkSolved" #-} do
   env <- asks searchTopEnv
   withBranchState branch $ withEnv env $ do
     openMetas <- getOpenMetas
@@ -919,7 +923,7 @@ updateBranchCost :: (Costs -> Int) -> Component -> [MetaId] -> SearchBranch -> S
 updateBranchCost costFn comp = updateBranch' $ Just (costFn, comp)
 
 assignMeta :: MetaId -> Term -> Type -> SM [MetaId]
-assignMeta metaId term metaType =
+assignMeta metaId term metaType = {-# SCC "custom-assignMeta" #-}
   metasCreatedBy (do
     metaVar <- lookupLocalMeta metaId
     metaArgs <- getMetaContextArgs metaVar
@@ -940,7 +944,7 @@ withBranchState br ma = {- withEnv (sbTCEnv br) $ -} do
   ma
 
 withBranchAndGoal :: SearchBranch -> Goal -> SM a -> SM a
-withBranchAndGoal br goal ma = withEnv (goalEnv goal) (withBranchState br ma)
+withBranchAndGoal br goal ma = withEnv (goalEnv goal) $ withMetaId (goalMeta goal) $ withBranchState br ma
 
 nextBranchMeta' :: SearchBranch -> SM (Goal, SearchBranch)
 nextBranchMeta' = fmap (fromMaybe __IMPOSSIBLE__) . nextBranchMeta
@@ -990,7 +994,7 @@ getEverythingInScope metaVar = do
 
 dumbUnifier :: (MonadTCM tcm, PureTCM tcm, MonadWarning tcm, MonadStatistics tcm, MonadMetaSolver tcm, MonadFresh Int tcm, MonadFresh ProblemId tcm)
   => Type -> Type -> tcm Bool
-dumbUnifier t1 t2 =
+dumbUnifier t1 t2 = {-# SCC "custom-dumbUnifier" #-}
   (noConstraints $ equalType t2 t1 >> return True) `catchError` \err -> do
 --     str <- showTCM err
 --     mlog $ "dumbUnifier error: " ++ str
@@ -1018,7 +1022,7 @@ concatUnzip xs = let (as, bs) = unzip xs in (concat as, concat bs)
 
 
 mlog :: Monad m => String -> m ()
-mlog str = doLog str $ return ()
+mlog str = {- doLog str $ -} return ()
 
 mlog' :: Monad m => String -> m ()
 mlog' str = doLog str $ return ()
