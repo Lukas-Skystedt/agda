@@ -112,7 +112,7 @@ lispifyResponse (Resp_SolveAll ps) = return
 -- TODO: For now, I piggy-back on the Resp_SolveAll implementation
 lispifyResponse (Resp_Mimer ii str) = return
   [ lastTag 1 $
-      L [ A "agda2-give-action", showNumIId ii, A $ quote str ]
+      L [ A "agda2-solve-action", showNumIId ii, A $ quote str ]
   ]
 
 lispifyDisplayInfo :: DisplayInfo -> TCM [Lisp String]
