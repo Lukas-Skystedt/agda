@@ -5,7 +5,7 @@ module Agda.Mimer.Mimer
   where
 
 import Control.DeepSeq (force, NFData(..))
-import Control.Monad ((>=>), unless, foldM, when)
+import Control.Monad ((>=>), (=<<), unless, foldM, when)
 import Control.Monad.Except (catchError)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT(..), runReaderT, asks)
@@ -23,9 +23,9 @@ import GHC.Generics (Generic)
 import qualified Agda.Benchmarking as Bench
 import Agda.Syntax.Abstract (Expr(AbsurdLam))
 import Agda.Syntax.Abstract.Name (QName(..), Name(..))
-import Agda.Syntax.Common (InteractionId, MetaId(..), ArgInfo(..), defaultArgInfo, Origin(..), ConOrigin(..), Hiding(..), setOrigin, NameId, Nat)
+import Agda.Syntax.Common (InteractionId, MetaId(..), ArgInfo(..), defaultArgInfo, Origin(..), ConOrigin(..), Hiding(..), setOrigin, NameId, Nat, namedThing, unArg)
 import Agda.Syntax.Info (exprNoRange)
-import Agda.Syntax.Internal (Type, Type''(..), Term(..), Dom'(..), Abs(..), arity , ConHead(..), Sort'(..), Level, argFromDom, Level'(..), absurdBody, Dom)
+import Agda.Syntax.Internal -- (Type, Type''(..), Term(..), Dom'(..), Abs(..), arity , ConHead(..), Sort'(..), Level, argFromDom, Level'(..), absurdBody, Dom, namedClausePats, Pattern'(..), dbPatVarIndex)
 import Agda.Syntax.Internal.MetaVars (AllMetas(..))
 import Agda.Syntax.Position (Range)
 import qualified Agda.Syntax.Scope.Base as Scope
@@ -33,6 +33,7 @@ import Agda.Syntax.Translation.InternalToAbstract (reify)
 import Agda.TypeChecking.Constraints (noConstraints)
 import Agda.TypeChecking.Conversion (equalType)
 import qualified Agda.TypeChecking.Empty as Empty -- (isEmptyType)
+import Agda.TypeChecking.Free (flexRigOccurrenceIn)
 import Agda.TypeChecking.MetaVars (newValueMeta)
 import Agda.TypeChecking.Monad -- (MonadTCM, lookupInteractionId, getConstInfo, liftTCM, clScope, getMetaInfo, lookupMeta, MetaVariable(..), metaType, typeOfConst, getMetaType, MetaInfo(..), getMetaTypeInContext)
 import Agda.TypeChecking.Pretty (MonadPretty, prettyTCM, PrettyTCM(..))
@@ -69,6 +70,7 @@ mimer ii range argStr = liftTCM $ do
 
     start <- liftIO $ getCPUTime
     mlog' $ "Start time: " ++ prettyShow start
+
 
     opts <- parseOptions ii range argStr
     mlog $ show opts
@@ -149,6 +151,9 @@ data Components = Components
   , hintWhere :: [Component]
   -- ^ A definition in a where clause
   , hintProjections :: [Component]
+  , hintRecVars :: [Nat]
+  -- ^ Variables that are candidates for arguments to recursive calls
+  , hintThisFn :: Maybe Component
   }
   deriving (Generic)
 instance NFData Components
@@ -187,6 +192,7 @@ data Costs = Costs
   , costLet :: Int
   , costLevel :: Int
   , costSet :: Int -- Should probably be replaced with multiple different costs
+  , costRecCall :: Int
   }
 
 noCost :: Int
@@ -204,6 +210,7 @@ defaultCosts = Costs
   , costLet = 1
   , costLevel = 2
   , costSet = 2
+  , costRecCall = 2
   }
 
 -- TODO: Maybe there should be an instance @MonadTCM m => MonadMetaSolver m@?
@@ -313,20 +320,22 @@ nextBranchMeta branch = case sbGoals branch of
   (goal : goals) ->
     return $ Just (goal, branch{sbGoals=goals})
 
+-- TODO: Rename (see metaInstantiation)
 getMetaInstantiation :: (MonadTCM tcm, PureTCM tcm, MonadDebug tcm, MonadInteractionPoints tcm, MonadFresh NameId tcm)
   => MetaId -> tcm (Maybe Expr)
-getMetaInstantiation metaId = do
-  metaVar <- lookupLocalMeta metaId
-  case mvInstantiation metaVar of
-    -- TODO: Change ReduceAndEtaContract class to avoid lift?
-    InstV inst -> do
-      mlog $ "Meta instantiation (non-contracted): " ++ prettyShow (instBody inst)
-      -- NOTE: instantiateFull also does eta reduction
-      res <- Just <$> (reify =<< {- etaContract' =<< -} instantiateFull (instBody inst))
-      return res
-    _ -> return Nothing
+getMetaInstantiation = metaInstantiation >=> go
+  where
+    -- TODO: Cleaner way of juggling the maybes here?
+    go Nothing = return Nothing
+    go (Just term) = do
+      mlog $ "Meta instantiation (non-contracted): " ++ prettyShow term
+      expr <- instantiateFull term >>= reify
+      return $ Just expr
 
-
+metaInstantiation :: (MonadTCM tcm, MonadDebug tcm, ReadTCState tcm) => MetaId -> tcm (Maybe Term)
+metaInstantiation metaId = lookupLocalMeta metaId <&> mvInstantiation >>= \case
+  InstV inst -> return $ Just $ instBody inst
+  _ -> return Nothing
 
 ------------------------------------------------------------------------------
 -- * Components
@@ -343,6 +352,8 @@ collectComponents opts mDefName metaId = do
         , hintAxioms = []
         , hintLevel = []
         , hintWhere = []
+        , hintRecVars = []
+        , hintThisFn = Nothing
         }
   metaVar <- lookupLocalMeta metaId
   hintNames <- getEverythingInScope metaVar
@@ -355,6 +366,8 @@ collectComponents opts mDefName metaId = do
     , hintAxioms = doSort $ hintAxioms components'
     , hintLevel = doSort $ hintLevel components'
     , hintWhere = doSort $ hintWhere components'
+    , hintRecVars = hintRecVars components'
+    , hintThisFn = hintThisFn components'
     }
   where
     hintMode = optHintMode opts
@@ -383,6 +396,7 @@ collectComponents opts mDefName metaId = do
           return comps
         -- If the function is in the same mutual block, do not include it.
         f@Function{}
+          | Just qname == mDefName -> return comps{hintThisFn = Just $ mkComponentQ qname (Def qname []) typ}
           | isToLevel typ && isNotMutual qname f
             -> return comps{hintLevel = mkComponentQ qname (Def qname []) typ : hintLevel comps}
           | isNotMutual qname f && shouldKeep -- TODO: Check if local to module or not
@@ -434,6 +448,38 @@ getLetVars = asksTC envLetBindings >>= mapM bindingToComp . Map.toAscList
 builtinLevelName :: String
 builtinLevelName = "Agda.Primitive.Level"
 
+collectRecVarCandidates :: InteractionId -> TCM [Nat]
+collectRecVarCandidates ii = do
+  ipc <- ipClause <$> lookupInteractionPoint ii
+  let fnName = ipcQName ipc
+      clauseNr = ipcClauseNo ipc
+
+  info <- getConstInfo fnName
+  typ <- typeOfConst fnName
+  case theDef info of
+    fnDef@Function{} -> do
+      let clause = funClauses fnDef !! clauseNr
+          naps = namedClausePats clause
+          flex = concatMap (go False . namedThing . unArg) naps
+      -- TODO: Names (we don't use flex)
+      mlog $ "naps: " ++ prettyShow naps
+      mlog $ "flex: " ++ show flex
+      return flex
+    _ -> do
+      mlog $ "Did not get a function"
+      return []
+  where
+    go isUnderCon = \case
+      VarP patInf x | isUnderCon -> [{- var $ -} dbPatVarIndex x]
+                    | otherwise -> []
+      DotP patInf t -> [] -- Ignore dot patterns
+      ConP conHead conPatInf namedArgs -> concatMap (go True . namedThing . unArg) namedArgs
+      LitP{} -> []
+      ProjP{} -> []
+      IApplyP{} -> [] -- Only for Cubical?
+      DefP{} -> [] -- Only for Cubical?
+
+
 ------------------------------------------------------------------------------
 -- * Core algorithm
 ------------------------------------------------------------------------------
@@ -448,7 +494,10 @@ runSearch options stopAfterFirst ii = withInteractionId ii $ do
 
   state <- getTC
   env <- askTC
-  components <- collectComponents options mTheFunctionQName metaId
+
+  recVars <- collectRecVarCandidates ii
+  components' <- collectComponents options mTheFunctionQName metaId
+  let components = components'{hintRecVars = recVars}
 
 
   -- TODO: What if metaIds is empty? (The whole thing was solved by unification)
@@ -538,9 +587,10 @@ refine branch = withBranchState branch $ do
           results2 <- tryDataRecord goal' goalType' branch''
           results3 <- tryLet goal' goalType' branch''
           results4 <- tryProjs goal' goalType' branch''
-          results5 <- tryFns goal' goalType' branch''
-          results6 <- tryAxioms goal' goalType' branch''
-          return (results1 ++ results2 ++ results3 ++ results4 ++ results5 ++ results6)
+          -- results5 <- tryRecCall goal' goalType' branch''
+          results6 <- tryFns goal' goalType' branch''
+          results7 <- tryAxioms goal' goalType' branch''
+          return (results1 ++ results2 ++ results3 ++ results4 ++ {- results5 ++ -} results6 ++ results7)
 
 tryFns :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
 tryFns goal goalType branch = withBranchAndGoal branch goal $ do
@@ -563,6 +613,7 @@ tryAxioms goal goalType branch = withBranchAndGoal branch goal $ do
 tryLet :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
 tryLet goal goalType branch = withBranchAndGoal branch goal $ do
   (goal', letVars) <- getLetVarsCached
+  mlog $ "Let vars: " ++ prettyShow letVars
   newBranches <- catMaybes <$> mapM (tryRefineAddMetas costLet goal' goalType branch) letVars
   mapM checkSolved newBranches
   where getLetVarsCached =
@@ -628,6 +679,29 @@ tryLocals goal goalType branch = withBranchAndGoal branch goal $ do
   let localVars' = localVars -- permute (takeP (length localVars) $ mvPermutation metaVar) localVars
   newBranches <- catMaybes <$> mapM (tryRefineAddMetas costLocal goal goalType branch) localVars'
   mapM checkSolved newBranches
+
+tryRecCall :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
+tryRecCall goal goalType branch = asks (hintThisFn . searchComponents) >>= \case
+  Nothing -> return []
+  Just thisFn -> withBranchAndGoal branch goal $ do
+    localVars <- bench [Bench.Deserialization, Bench.Level] $ getLocalVars
+    recCand <- asks (hintRecVars . searchComponents)
+    let recCandidates = filter (\t -> case compTerm t of Var n _ -> n `elem` recCand; _ -> False) localVars
+
+    case recCandidates of
+      -- If there are no argument candidates for recursive call, there is no reason to try one.
+      [] -> return []
+      _ -> tryRefineAddMetas (costRecCall) goal goalType branch thisFn >>= \case
+        Nothing -> do
+            mlog $ "Failed to refine with recursive call (before adding arguments)"
+            return []
+        Just branch' -> do
+          mRecInstantiation <- metaInstantiation (goalMeta goal)
+          mlog $ "recInstantiation: " ++ prettyShow mRecInstantiation
+          return []
+
+
+      -- mapM checkSolved newBranches
 
 -- TODO: Factor out `checkSolved`
 tryDataRecord :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
@@ -834,12 +908,12 @@ assignMeta metaId term metaType = bench [Bench.Deserialization, Bench.CheckRHS] 
     metaVar <- lookupLocalMeta metaId
     metaArgs <- getMetaContextArgs metaVar
     mlog $ "assignMeta: assigning " ++ prettyShow term ++ " to " ++ prettyShow metaId
-    assignV DirLeq metaId metaArgs term (AsTermsOf metaType))
-    >>= \case
-    ((), newMetaStore) -> do
-      let newMetaIds = Map.keys (openMetas newMetaStore)
-      mlog $ "New metas created in assignMeta: " ++ prettyShow newMetaIds
-      return newMetaIds
+    (assignV DirLeq metaId metaArgs term (AsTermsOf metaType)) `catchError` \err -> do
+      mlog =<< ("Got error from assignV: " ++) <$> showTCM err) >>= \case
+        ((), newMetaStore) -> do
+          let newMetaIds = Map.keys (openMetas newMetaStore)
+          mlog $ "New metas created in assignMeta: " ++ prettyShow newMetaIds
+          return newMetaIds
 
 
 
@@ -917,7 +991,9 @@ instance Pretty Components where
       , text "hintAxioms=" <> pretty (hintAxioms comps)
       , text "hintLevel=" <> pretty (hintLevel comps)
       , text "hintWhere=" <> pretty (hintWhere comps)
-      , text "hintProjections=" <> pretty (hintProjections comps)])
+      , text "hintProjections=" <> pretty (hintProjections comps)
+      , text "hintRecVars=" <> pretty (hintRecVars comps)
+      ])
 
 -- instance Pretty Goal where
 --   pretty goal =
