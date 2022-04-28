@@ -63,6 +63,7 @@ import Agda.Utils.Monad (unlessM)
 import Agda.Utils.Permutation (idP, permute, takeP)
 import Agda.Utils.Pretty (Pretty, prettyShow, render, pretty, braces, prettyList_)
 import Agda.Utils.Pretty (text)
+import Agda.Utils.Time (getCPUTime)
 import Agda.Utils.Tuple (mapFst, mapSnd)
 import qualified Agda.Benchmarking as Bench
 import qualified Agda.Syntax.Scope.Base as Scope
@@ -83,6 +84,10 @@ mimer :: MonadTCM tcm
   -> String
   -> tcm MimerResult
 mimer ii range argStr = liftTCM $ do
+
+    start <- liftIO $ getCPUTime
+    mlog' $ "Start time: " ++ prettyShow start
+
     opts <- parseOptions ii range argStr
     mlog $ show opts
 
@@ -98,9 +103,11 @@ mimer ii range argStr = liftTCM $ do
           [] -> "?"
           (sol:_) -> sol
 
-    openMetas <- getOpenMetas
-    mlog $ "Remaining open metas: " ++ prettyShow openMetas
     putTC oldState
+
+    stop  <- liftIO $ getCPUTime
+    mlog' $ "Result: " ++ s
+    mlog' $ "Stop time: " ++ prettyShow stop ++ ". Elapsed: " ++ prettyShow (stop - start)
     return $ MimerResult $ s
 
 
@@ -312,7 +319,7 @@ runBfs options stopAfterFirst ii = withInteractionId ii $ do
                   return ([], n)
         (sols, nrSteps) <- go 0 $ Q.singleton startBranch
         solStrs <- mapM showTCM sols
-        mlog' $ "Final solution (after " ++ show nrSteps ++ " steps)\n: " ++ unlines solStrs
+        mlog' $ "Final solution (after " ++ show nrSteps ++ " steps):\n" ++ unlines solStrs
         return solStrs
   where
     partitionStepResult :: MinQueue SearchBranch -> [SearchStepResult] -> (MinQueue SearchBranch, [Expr])
@@ -384,7 +391,7 @@ collectComponents opts mDefName metaId = do
         f@Function{}
           | isToLevel typ && isNotMutual qname f
             -> return comps{hintLevel = mkComponentQ qname (Def qname []) typ : hintLevel comps}
-          | isNotMutual qname f && (hintMode /= NoHints || qname `elem` explicitHints) -- TODO: Check if local to module or not
+          | isNotMutual qname f && shouldKeep -- TODO: Check if local to module or not
             -> return comps{hintFns = mkComponentQ qname (Def qname []) typ : hintFns comps}
           | otherwise -> return comps
         Datatype{} -> return comps{hintDataTypes = mkComponentQ qname (Def qname []) typ : hintDataTypes comps}
@@ -397,10 +404,13 @@ collectComponents opts mDefName metaId = do
         Constructor{} -> return comps
         -- TODO: special treatment for primitives?
         Primitive{} | isToLevel typ -> return comps{hintLevel = mkComponentQ qname (Def qname []) typ : hintLevel comps}
-                    | otherwise -> return comps{hintFns = mkComponentQ qname (Def qname []) typ : hintFns comps}
+                    | shouldKeep -> return comps{hintFns = mkComponentQ qname (Def qname []) typ : hintFns comps}
+                    | otherwise -> return comps
         PrimitiveSort{} -> do
           mlog $ "Collect: Primitive " ++ prettyShow (theDef info)
           return comps
+      where
+        shouldKeep = hintMode /= NoHints || qname `elem` explicitHints
 
     -- NOTE: We do not reduce the type before checking, so some user definitions
     -- will not be included here.
@@ -430,13 +440,20 @@ bfsRefine branch = withBranchState branch $ do
           results1 <- bfsLocals goal' goalType' branch''
           results2 <- bfsDataRecord goal' goalType' branch''
           results3 <- bfsLet goal' goalType' branch''
-          results4 <- bfsFnProjs goal' goalType' branch''
-          return (results1 ++ results2 ++ results3 ++ results4)
+          results4 <- bfsProjs goal' goalType' branch''
+          results5 <- bfsFns goal' goalType' branch''
+          return (results1 ++ results2 ++ results3 ++ results4 ++ results5)
 
-bfsFnProjs :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
-bfsFnProjs goal goalType branch = withBranchAndGoal branch goal $ do
+bfsFns :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
+bfsFns goal goalType branch = withBranchAndGoal branch goal $ do
   fns <- asks (hintFns . searchComponents)
   newBranches <- catMaybes <$> mapM (bfsTryRefineAddMetas costFn goal goalType branch) fns
+  mapM checkSolved newBranches
+
+bfsProjs :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
+bfsProjs goal goalType branch = withBranchAndGoal branch goal $ do
+  projs <- asks (hintProjections . searchComponents)
+  newBranches <- catMaybes <$> mapM (bfsTryRefineAddMetas costProj goal goalType branch) projs
   mapM checkSolved newBranches
 
 bfsLet :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
@@ -817,7 +834,7 @@ bench k ma = billTo (Bench.Deserialization:k) ma
 
 
 mlog :: Monad m => String -> m ()
-mlog str = {- doLog str $ -} return ()
+mlog str = doLog str $ return ()
 
 mlog' :: Monad m => String -> m ()
 mlog' str = doLog str $ return ()

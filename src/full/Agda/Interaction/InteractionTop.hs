@@ -72,6 +72,7 @@ import Agda.Compiler.Backend
 
 import Agda.Auto.Auto as Auto
 import Agda.Mimer.Mimer as Mimer
+import qualified Control.DeepSeq as DeepSeq
 
 import Agda.Utils.Either
 import Agda.Utils.FileName
@@ -731,8 +732,10 @@ interpret Cmd_autoAll = do
     modifyTheInteractionPoints (List.\\ concat solved)
 
 interpret (Cmd_mimer ii range str) = do
-  Mimer.MimerResult result <- Mimer.mimer ii range str
+  -- TODO: This way of measuring time does not work
+  (time, Mimer.MimerResult result) <- maybeTimed $ Mimer.mimer ii range str
   putResponse $ Resp_Mimer ii result
+  maybe (return ()) (display_info . Info_Time) time
 
 interpret (Cmd_context norm ii _ _) =
   display_info . Info_Context ii =<< liftLocalState (B.getResponseContext norm ii)

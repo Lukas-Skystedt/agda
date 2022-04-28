@@ -111,7 +111,7 @@ lispifyResponse (Resp_SolveAll ps) = return
     prn (ii,e)= [showNumIId ii, A $ quote $ prettyShow e]
 -- TODO: For now, I piggy-back on the Resp_SolveAll implementation
 lispifyResponse (Resp_Mimer ii str) = return
-  [ lastTag 1 $
+  [ lastTag 1 $ -- TODO: What is this lastTag used for?
       L [ A "agda2-solve-action", showNumIId ii, A $ quote str ]
   ]
 
