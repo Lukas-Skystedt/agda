@@ -5,7 +5,7 @@ module Agda.Mimer.Mimer
   where
 
 import Control.DeepSeq (force, NFData(..))
-import Control.Monad ((>=>), unless, foldM)
+import Control.Monad ((>=>), unless, foldM, when)
 import Control.Monad.Except (catchError)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT(..), runReaderT, asks)
@@ -52,7 +52,7 @@ import Agda.Utils.Tuple (mapFst)
 import Agda.Mimer.Options
 
 import System.IO.Unsafe (unsafePerformIO)
-
+import Data.IORef (IORef, writeIORef, readIORef, newIORef)
 
 newtype MimerResult = MimerResult String
 
@@ -62,6 +62,10 @@ mimer :: MonadTCM tcm
   -> String
   -> tcm MimerResult
 mimer ii range argStr = liftTCM $ do
+    -- TODO: Get proper logging
+    verb <- hasVerbosity "mimer.all" 10
+    liftIO $ writeIORef shouldLog verb
+    mlog' $ "Mimer running verbose: " ++ show verb
 
     start <- liftIO $ getCPUTime
     mlog' $ "Start time: " ++ prettyShow start
@@ -179,6 +183,7 @@ data Costs = Costs
   , costRecordCon :: Int
   , costSpeculateProj :: Int
   , costProj :: Int
+  , costAxiom :: Int
   , costLet :: Int
   , costLevel :: Int
   , costSet :: Int -- Should probably be replaced with multiple different costs
@@ -195,6 +200,7 @@ defaultCosts = Costs
   , costRecordCon = 2
   , costSpeculateProj = 2
   , costProj = 2
+  , costAxiom = 3
   , costLet = 1
   , costLevel = 2
   , costSet = 2
@@ -532,7 +538,8 @@ refine branch = withBranchState branch $ do
           results3 <- tryLet goal' goalType' branch''
           results4 <- tryProjs goal' goalType' branch''
           results5 <- tryFns goal' goalType' branch''
-          return (results1 ++ results2 ++ results3 ++ results4 ++ results5)
+          results6 <- tryAxioms goal' goalType' branch''
+          return (results1 ++ results2 ++ results3 ++ results4 ++ results5 ++ results6)
 
 tryFns :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
 tryFns goal goalType branch = withBranchAndGoal branch goal $ do
@@ -544,6 +551,12 @@ tryProjs :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
 tryProjs goal goalType branch = withBranchAndGoal branch goal $ do
   projs <- asks (hintProjections . searchComponents)
   newBranches <- catMaybes <$> mapM (tryRefineAddMetas costProj goal goalType branch) projs
+  mapM checkSolved newBranches
+
+tryAxioms :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
+tryAxioms goal goalType branch = withBranchAndGoal branch goal $ do
+  axioms <- asks (hintAxioms . searchComponents)
+  newBranches <- catMaybes <$> mapM (tryRefineAddMetas costAxiom goal goalType branch) axioms
   mapM checkSolved newBranches
 
 tryLet :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
@@ -849,7 +862,9 @@ bench k ma = billTo (Bench.Deserialization:k) ma
   -- return $ force r
 
 mlog :: Monad m => String -> m ()
-mlog str = {- doLog str $ -} return ()
+mlog str =  do
+  let l = unsafePerformIO $ readIORef shouldLog
+  when l $ doLog str (return ())
 
 mlog' :: Monad m => String -> m ()
 mlog' str = doLog str $ return ()
@@ -858,6 +873,10 @@ doLog :: String -> a -> a
 doLog str e = unsafePerformIO $ do
   appendFile "/home/lukas/mimer.log" (str ++ "\n")
   return e
+
+{-# NOINLINE shouldLog #-}
+shouldLog :: IORef Bool
+shouldLog = unsafePerformIO $ newIORef False
 
 -- Local variables:
 -- getContext :: MonadTCEnv m => m [Dom (Name, Type)]
