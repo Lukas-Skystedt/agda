@@ -371,7 +371,8 @@ collectComponents opts mDefName metaId = do
       typ <- typeOfConst qname
       case theDef info of
         Axiom{} | isToLevel typ -> return comps{hintLevel = mkComponentQ qname (Def qname []) typ : hintLevel comps}
-                | otherwise -> return comps{hintAxioms = mkComponentQ qname (Def qname []) typ : hintAxioms comps}
+                | shouldKeep -> return comps{hintAxioms = mkComponentQ qname (Def qname []) typ : hintAxioms comps}
+                | otherwise -> return comps
         -- TODO: Check if we want to use these
         DataOrRecSig{} -> return comps
         GeneralizableVar -> do
