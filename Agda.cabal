@@ -368,6 +368,7 @@ library
                     Agda.Interaction.Options.Lenses
                     Agda.Interaction.Options.Warnings
                     Agda.Main
+                    Agda.Mimer.Debug
                     Agda.Mimer.Mimer
                     Agda.Mimer.Options
                     Agda.Syntax.Abstract.Name

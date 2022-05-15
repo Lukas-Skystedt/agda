@@ -10,6 +10,7 @@ import Agda.Syntax.Position (Range)
 import qualified Agda.Syntax.Abstract as A
 import qualified Agda.Syntax.Abstract.Name as AN
 import Agda.Utils.Maybe (catMaybes)
+import Agda.Utils.Pretty (Pretty, pretty, text)
 
 type MilliSeconds = Int
 
@@ -58,3 +59,6 @@ readTokens ("-m"     : ws) = M          : readTokens ws
 readTokens ("-c"     : ws) = C          : readTokens ws
 readTokens ("-r"     : ws) = R          : readTokens ws
 readTokens (h        : ws) = H h        : readTokens ws
+
+instance Pretty HintMode where
+  pretty = text . show
