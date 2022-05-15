@@ -11,7 +11,7 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT(..), runReaderT, asks)
 import Data.Function (on)
 import Data.Functor ((<&>))
-import Data.List (sortOn, intersect, transpose)
+import Data.List (sortOn, intersect, transpose, (\\))
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (maybeToList, fromMaybe, maybe)
@@ -42,12 +42,12 @@ import Agda.TypeChecking.Pretty (MonadPretty, prettyTCM, PrettyTCM(..))
 import Agda.TypeChecking.Reduce (reduce, instantiateFull)
 import Agda.TypeChecking.Rules.Term  (lambdaAddContext)
 import Agda.TypeChecking.Substitute.Class (apply)
-import Agda.TypeChecking.Telescope (piApplyM, flattenTel)
+import Agda.TypeChecking.Telescope (piApplyM, flattenTel, teleArgs)
 import Agda.Utils.Benchmark (billTo)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Maybe (catMaybes)
 -- import Agda.Utils.Permutation (idP, permute, takeP)
-import Agda.Utils.Pretty (Pretty, Doc, prettyShow, prettyList, render, pretty, braces, prettyList_, text, (<+>), nest, lbrace, rbrace, comma, ($$), vcat, ($+$), align, cat)
+import Agda.Utils.Pretty (Pretty, Doc, prettyShow, prettyList, render, pretty, braces, prettyList_, text, (<+>), nest, lbrace, rbrace, comma, ($$), vcat, ($+$), align, cat, parens)
 import Agda.Utils.Time (getCPUTime)
 import Agda.Utils.Tuple (mapFst)
 
@@ -157,7 +157,7 @@ data Components = Components
   , hintWhere :: [Component]
   -- ^ A definition in a where clause
   , hintProjections :: [Component]
-  , hintRecVars :: [Nat]
+  , hintRecVars :: Open [Term]
   -- ^ Variables that are candidates for arguments to recursive calls
   , hintThisFn :: Maybe Component
   }
@@ -352,6 +352,7 @@ metaInstantiation metaId = lookupLocalMeta metaId <&> mvInstantiation >>= \case
 collectComponents :: (MonadTCM tcm, ReadTCState tcm, HasConstInfo tcm, MonadFresh NameId tcm, MonadInteractionPoints tcm, MonadStConcreteNames tcm, PureTCM tcm)
   => Options -> Maybe QName -> MetaId -> tcm Components
 collectComponents opts mDefName metaId = do
+  emptyRecVars <- makeOpen []
   let components = Components
         { hintFns = []
         , hintDataTypes = []
@@ -360,7 +361,7 @@ collectComponents opts mDefName metaId = do
         , hintAxioms = []
         , hintLevel = []
         , hintWhere = []
-        , hintRecVars = []
+        , hintRecVars = emptyRecVars
         , hintThisFn = Nothing
         }
   metaVar <- lookupLocalMeta metaId
@@ -456,7 +457,7 @@ getLetVars = asksTC envLetBindings >>= mapM bindingToComp . Map.toAscList
 builtinLevelName :: String
 builtinLevelName = "Agda.Primitive.Level"
 
-collectRecVarCandidates :: InteractionId -> TCM [Nat]
+collectRecVarCandidates :: InteractionId -> TCM (Open [Term])
 collectRecVarCandidates ii = do
   ipc <- ipClause <$> lookupInteractionPoint ii
   let fnName = ipcQName ipc
@@ -468,14 +469,31 @@ collectRecVarCandidates ii = do
     fnDef@Function{} -> do
       let clause = funClauses fnDef !! clauseNr
           naps = namedClausePats clause
-          flex = concatMap (go False . namedThing . unArg) naps
+
+      -- Telescope at interaction point
+      iTel <- getContextTelescope
+      -- Telescope for the body of the clause
+      let cTel = clauseTel clause
+      -- HACK: To get the correct indices, we shift by the difference in telescope lengths
+      -- TODO: Difference between teleArgs and telToArgs?
+      let shift = length (telToArgs iTel) - length (telToArgs cTel)
+
+      reportSDoc "mimer" 60 $ do
+        pITel <- prettyTCM iTel
+        pCTel <- prettyTCM cTel
+        return ("Tel:" $+$ nest 2 (pretty iTel $+$ pITel) $+$ "CTel:" $+$ nest 2 (pretty cTel $+$ pCTel))
+      reportSDoc "mimer" 60 $ return $ "Shift:" <+> pretty shift
+      -- makeOpen
+
       -- TODO: Names (we don't use flex)
+      let flex = concatMap (go False . namedThing . unArg) naps
+          terms = map (\n -> Var (n + shift) []) flex
       mlog $ "naps: " ++ prettyShow naps
-      mlog $ "flex: " ++ show flex
-      return flex
+      mlog $ "terms: " ++ show terms
+      makeOpen terms
     _ -> do
       mlog $ "Did not get a function"
-      return []
+      makeOpen []
   where
     go isUnderCon = \case
       VarP patInf x | isUnderCon -> [{- var $ -} dbPatVarIndex x]
@@ -619,7 +637,7 @@ runSearch options stopAfterFirst ii = withInteractionId ii $ do
                   reportSLn "mimer.search" 30 $ "Search time limit reached. Elapsed search time: " ++ show elapsed
                   return ([], n)
         (sols, nrSteps) <- go 0 $ Q.singleton startBranch
-        reportSLn "mimer.search" 20 $ "Search ended after " ++ show nrSteps ++ " cycles"
+        reportSLn "mimer.search" 20 $ "Search ended after " ++ show (nrSteps + 1) ++ " cycles"
         solStrs <- mapM showTCM sols
         reportSLn "mimer.search" 15 $ "Solutions found: " ++ prettyShow solStrs
         return solStrs
@@ -773,53 +791,66 @@ tryRecCall goal goalType branch = asks (hintThisFn . searchComponents) >>= \case
   Nothing -> return []
   Just thisFn -> withBranchAndGoal branch goal $ do
     localVars <- bench [Bench.Deserialization, Bench.Level] $ getLocalVars
-    recCand <- asks (hintRecVars . searchComponents)
-    let recCandidates = filter (\t -> case compTerm t of Var n _ -> n `elem` recCand; _ -> False) localVars
+    recCand <- asks (hintRecVars . searchComponents) >>= getOpen
+    let recCandidates = filter (\t -> case compTerm t of v@Var{} -> v `elem` recCand; _ -> False) localVars
+    reportSDoc "mimer.refine.rec" 60 $ ("Argument candidates for recursive call:" <+>) <$> prettyTCM recCandidates
 
     case recCandidates of
       -- If there are no argument candidates for recursive call, there is no reason to try one.
       [] -> return []
       _ -> do
-        -- HACK: If the meta-variable is set to run occurs check, assigning a
-        -- recursive call to it will cause an error. Therefore, we create a new
-        -- meta-variable with the check disabled and assign it to the previous
-        -- one.
-        (goal', branch') <- do
-          metaVar <- lookupLocalMeta (goalMeta goal)
-          if miMetaOccursCheck (mvInfo metaVar) == DontRunMetaOccursCheck
-          then do
-            reportDoc "mimer.refine.rec" 60 $ "Meta-variable already has DontRunMetaOccursCheck"
-            return (goal, branch)
-          else do
-            metaArgs <- getMetaContextArgs metaVar
-            (newMetaId, newMetaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq goalType
-            assignV DirLeq (goalMeta goal) metaArgs newMetaTerm (AsTermsOf goalType)
-            reportDoc "mimer.refine.rec" 60 $ "Instantiating meta-variable (" <> pretty (goalMeta goal) <> ") with a new one with DontRunMetaOccursCheck (" <> pretty newMetaId <> ")"
-            branch' <- updateBranch [] branch
-            return (goal{goalMeta = newMetaId}, branch')
+        -- Disable occurs check for the variable to allow recursive call
+        (goal', branch') <- ensureNoOccursCheck goal branch
+        -- Apply the recursive call to new metas
         (thisFnTerm', thisFnType, newMetas) <- applyToMetas 0 (compTerm thisFn) (compType thisFn)
+        let thisFnComp = mkComponent (compName thisFn) thisFnTerm' thisFnType
         -- Newly created metas must be stored in the branch state
         branch'' <- updateBranch [] branch'
-        let thisFnComp = mkComponent (compName thisFn) thisFnTerm' thisFnType
+
         reportSDoc "mimer.refine.rec" 60 $ return ("Recursive call component:" <+> pretty thisFnComp)
+        -- Try using the recursive call
         tryRefineWith costRecCall goal' goalType branch'' thisFnComp >>= \case
+          -- Recursive call failed
           Nothing -> do
             reportSMDoc "mimer.refine.rec" 60 $ "Assigning the recursive call failed"
             return []
+          -- Recursive call succeeded
           Just branch''' -> do
             reportSMDoc "mimer.refine.rec" 60 $ "Assigning the recursive call succeeded"
-
             let argGoals = map (mkGoalPreserveLocalsAndEnv goal') newMetas
             let fillArg g = do
                   gType <- getMetaTypeInContext (goalMeta g)
                   reportSDoc "mimer.refine.rec" 60 $ return ("Arg " <+> pretty (goalMeta g) <+> ":" <+> pretty gType)
-                  r <- catMaybes <$> mapM (tryRefineWith (const 0) g gType branch''') recCandidates
+                  let remainingArgGoals = argGoals \\ [g]
+                  r <- catMaybes <$> mapM (\recCandidate -> do
+                     mbr <- tryRefineWith (const 0) g gType branch''' recCandidate
+                     return $ fmap (\br -> br{sbGoals = remainingArgGoals ++ sbGoals br}) mbr
+                     ) recCandidates
                   reportSDoc "mimer.refine.rec" 60 $ return ("Possibilities: " <+> pretty (length r))
                   return r
 
             argBranches <- concatMapM fillArg argGoals
             reportSDoc "mimer.refine.rec" 60 $ return ("Number of argument branches" <+> pretty (length argBranches))
             mapM checkSolved argBranches
+  where
+  -- HACK: If the meta-variable is set to run occurs check, assigning a
+  -- recursive call to it will cause an error. Therefore, we create a new
+  -- meta-variable with the check disabled and assign it to the previous
+  -- one.
+  ensureNoOccursCheck :: Goal -> SearchBranch -> SM (Goal, SearchBranch)
+  ensureNoOccursCheck goal branch = do
+    metaVar <- lookupLocalMeta (goalMeta goal)
+    if miMetaOccursCheck (mvInfo metaVar) == DontRunMetaOccursCheck
+    then do
+      reportDoc "mimer.refine.rec" 60 $ "Meta-variable already has DontRunMetaOccursCheck"
+      return (goal, branch)
+    else do
+      metaArgs <- getMetaContextArgs metaVar
+      (newMetaId, newMetaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq goalType
+      assignV DirLeq (goalMeta goal) metaArgs newMetaTerm (AsTermsOf goalType)
+      reportDoc "mimer.refine.rec" 60 $ "Instantiating meta-variable (" <> pretty (goalMeta goal) <> ") with a new one with DontRunMetaOccursCheck (" <> pretty newMetaId <> ")"
+      branch' <- updateBranch [] branch
+      return (goal{goalMeta = newMetaId}, branch')
 
 
 -- TODO: Factor out `checkSolved`
@@ -1132,7 +1163,7 @@ instance Pretty Components where
       , f "hintLevel" (hintLevel comps)
       , f "hintWhere" (hintWhere comps)
       , f "hintProjections" (hintProjections comps)
-      , f "hintRecVars" (hintRecVars comps)
+      , f "hintRecVars" (openThing $ hintRecVars comps)
       ]
     where
       f n [] = n <> ": []"
@@ -1181,6 +1212,14 @@ instance Pretty Costs where
         , ("costSet:"           , pretty $ costSet costs)
         , ("costRecCall:"       , pretty $ costRecCall costs)
         ]
+
+instance PrettyTCM Component where
+  prettyTCM comp = do
+    name <- maybe (return "_") prettyTCM $ compName comp
+    term <- prettyTCM $ compTerm comp
+    typ <- prettyTCM $ compType comp
+    return $ name <> "=" <> term <> ":" <> typ
+
 
 -- TODO: Not used but keep it around for debug printing
 concatMapM :: Monad m => (a -> m [b]) -> [a] -> m [b]
