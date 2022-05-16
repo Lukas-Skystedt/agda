@@ -5,7 +5,7 @@ module Agda.Mimer.Mimer
   where
 
 import Control.DeepSeq (force, NFData(..))
-import Control.Monad ((>=>), (=<<), unless, foldM, when)
+import Control.Monad ((>=>), (=<<), unless, foldM, when, zipWithM)
 import Control.Monad.Except (catchError)
 import Control.Monad.Error.Class (MonadError)
 import Control.Monad.IO.Class (liftIO)
@@ -116,8 +116,9 @@ type SM a = ReaderT SearchOptions TCM a
 
 data SearchBranch = SearchBranch
   { sbTCState :: TCState
-  , sbGoals :: [(Goal, ComponentCache)]
+  , sbGoals :: [Goal]
   , sbCost :: Int
+  , sbCache :: Map Substitution ComponentCache
   , sbComponentsUsed :: Map Name Int -- ^ Number of times each component has been used
   }
   deriving (Generic)
@@ -125,7 +126,7 @@ instance NFData SearchBranch
 
 -- | NOTE: Equality is only on the fields `sbCost` and `sbGoals`
 instance Eq SearchBranch where
-  sb1 == sb2 = sbCost sb1 == sbCost sb2 && map fst (sbGoals sb1) == map fst (sbGoals sb2)
+  sb1 == sb2 = sbCost sb1 == sbCost sb2 && sbGoals sb1 == sbGoals sb2
 
 -- TODO: Explain
 instance Ord SearchBranch where
@@ -137,12 +138,9 @@ data ComponentGen = ComponentDone Component
 
 instance NFData ComponentGen
 
-data ComponentCache = CompCache
-  { ccLocalVars :: Maybe (Open (), [(Maybe Component, ComponentGen)])
-  -- ^ The @Open ()@ is for keeping track of the context in which the components are valid
-  , ccComponents :: Maybe (Open (), Map Name (Maybe Component, ComponentGen))
-  } deriving (Generic)
-instance NFData ComponentCache
+
+-- | The @Open ()@ is for keeping track of the context in which the components are valid
+type ComponentCache = (Open (), Map CompId (Maybe Component, ComponentGen))
 
 data Goal = Goal
   { goalMeta :: MetaId
@@ -177,7 +175,14 @@ data Components = Components
 
 instance NFData Components
 
-data Component = Component {compTerm :: Term, compType :: Type, compName :: Maybe Name}
+type CompId = Int
+data Component = Component
+  { compId :: CompId -- ^ Unique id for the component. Used for the cache.
+  , compName :: Maybe Name -- ^ Used for keeping track of how many times a component has been used
+  , compTerm :: Term
+  , compType :: Type
+  , compCost :: Cost
+  }
   deriving (Eq, Generic)
 
 instance NFData Component
@@ -201,22 +206,23 @@ data SearchOptions = SearchOptions
   , searchStats :: IORef MimerStats
   }
 
-
+type Cost = Int
 data Costs = Costs
-  { costLocal :: Int
-  , costFn :: Int
-  , costDataCon :: Int
-  , costRecordCon :: Int
-  , costSpeculateProj :: Int
-  , costProj :: Int
-  , costAxiom :: Int
-  , costLet :: Int
-  , costLevel :: Int
-  , costSet :: Int -- Should probably be replaced with multiple different costs
-  , costRecCall :: Int
+  { costLocal :: Cost
+  , costFn :: Cost
+  , costDataCon :: Cost
+  , costRecordCon :: Cost
+  , costSpeculateProj :: Cost
+  , costProj :: Cost
+  , costAxiom :: Cost
+  , costLet :: Cost
+  , costLevel :: Cost
+  , costSet :: Cost -- Should probably be replaced with multiple different costs
+  , costRecCall :: Cost
+  , costNewMeta :: Cost
   }
 
-noCost :: Int
+noCost :: Cost
 noCost = 0
 
 defaultCosts :: Costs
@@ -232,6 +238,7 @@ defaultCosts = Costs
   , costLevel = 2
   , costSet = 2
   , costRecCall = 2
+  , costNewMeta = 1
   }
 
 -- TODO: Maybe there should be an instance @MonadTCM m => MonadMetaSolver m@?
@@ -258,25 +265,25 @@ predNat n | n > 0 = n - 1
 getRecordFields :: (HasConstInfo tcm, MonadTCM tcm) => QName -> tcm [QName]
 getRecordFields = fmap (map unDom . recFields . theDef) . getConstInfo
 
-qnameToTerm :: (MonadTCM tcm, HasConstInfo tcm, ReadTCState tcm) => QName -> tcm (Maybe (Term, Type))
-qnameToTerm qname = do
-  info <- getConstInfo qname
-  typ <- typeOfConst qname
-  let mTerm = case theDef info of
-        Axiom{} -> Just $ Def qname []
-        DataOrRecSig{} -> Nothing -- TODO
-        GeneralizableVar -> Just $ Def qname []
-        AbstractDefn{} -> Nothing -- TODO
-        Function{} -> Just $ Def qname []
-        Datatype{} -> Just $ Def qname []
-        Record{} -> Just $ Def qname []
-        c@Constructor{} -> Just $ Con (conSrcCon c) ConOCon []
-        Primitive{} -> Just $ Def qname [] -- TODO
-        PrimitiveSort{} -> Just $ Def qname [] -- TODO
-  return ((,typ) <$> mTerm)
+-- qnameToTerm :: (MonadTCM tcm, HasConstInfo tcm, ReadTCState tcm) => QName -> tcm (Maybe (Term, Type))
+-- qnameToTerm qname = do
+--   info <- getConstInfo qname
+--   typ <- typeOfConst qname
+--   let mTerm = case theDef info of
+--         Axiom{} -> Just $ Def qname []
+--         DataOrRecSig{} -> Nothing -- TODO
+--         GeneralizableVar -> Just $ Def qname []
+--         AbstractDefn{} -> Nothing -- TODO
+--         Function{} -> Just $ Def qname []
+--         Datatype{} -> Just $ Def qname []
+--         Record{} -> Just $ Def qname []
+--         c@Constructor{} -> Just $ Con (conSrcCon c) ConOCon []
+--         Primitive{} -> Just $ Def qname [] -- TODO
+--         PrimitiveSort{} -> Just $ Def qname [] -- TODO
+--   return ((,typ) <$> mTerm)
 
-qnameToComp :: (MonadTCM tcm, HasConstInfo tcm, ReadTCState tcm) => QName -> tcm (Maybe Component)
-qnameToComp qname = fmap (uncurry $ mkComponentQ qname) <$> qnameToTerm qname
+-- qnameToComp :: (MonadTCM tcm, HasConstInfo tcm, ReadTCState tcm) => QName -> tcm (Maybe Component)
+-- qnameToComp qname = fmap (uncurry $ mkComponentQ qname) <$> qnameToTerm qname
 
 -- TODO: Change the signature in original module instead.
 isEmptyType :: Type -> SM Bool
@@ -293,49 +300,36 @@ allOpenMetas t = do
   openMetas <- getOpenMetas
   return $ allMetas (:[]) t `intersect` openMetas
 
-emptyCompCache :: ComponentCache
-emptyCompCache = CompCache
-  { ccLocalVars = Nothing
-  , ccComponents = Nothing
-  }
+-- -- | Clear the parts of the cache that are not consistent with the current
+-- -- context.
+-- clearBadCxt :: ComponentCache -> SM ComponentCache
+-- clearBadCxt Nothing = return Nothing
+-- clearBadCxt (Just (opn, cache)) = checkpointSubstitution (openThingCheckpoint opn) >>= \case
+--   -- Identity substitution: the cache is valid
+--   IdS -> return $ Just (opn, cache)
+--   -- The cache is not valid
+--   _ -> return Nothing
 
+rmCache :: CompId -> ComponentCache -> ComponentCache
+rmCache cId cache = mapSnd (Map.delete cId) cache
 
--- | Clear the parts of the cache that are not consistent with the current
--- context.
-clearBadCxt :: ComponentCache -> SM ComponentCache
-clearBadCxt cache = do
-  comps <- check Map.empty $ ccComponents cache
-  locals <- check [] $ ccLocalVars cache
-  return cache {ccComponents = comps, ccLocalVars = locals}
-  where
-    check _ Nothing = return Nothing
-    check empty (Just (opn, a)) = checkpointSubstitution (openThingCheckpoint opn) >>= \case
-      -- Identity substitution: the cache is valid
-      IdS -> return $ Just (opn, a)
-      -- The cache is not valid
-      _ -> return Nothing
-
-rmCache :: Name -> ComponentCache -> ComponentCache
-rmCache name cache =
-  cache{ccComponents = fmap (mapSnd (Map.delete name)) $ ccComponents cache}
-
-rmCache' :: Maybe Name -> ComponentCache -> ComponentCache
-rmCache' Nothing cache = cache
-rmCache' (Just name) cache = rmCache name cache
-
--- | Requires that the cache is initialized. Does not check the cache's context.
-insertCache :: Name -> Component -> ComponentGen -> ComponentCache -> ComponentCache
-insertCache name comp compGen cache
-  | Just (opn, c) <- ccComponents cache =
-      cache{ccComponents = fmap (mapSnd (Map.insert name (Just comp, compGen))) $ ccComponents cache}
-  | otherwise = __IMPOSSIBLE__
+-- -- | Requires that the cache is initialized. Does not check the cache's context.
+-- -- TODO: Add debug check that there is not a component stored for the id
+-- insertCache :: CompId -> Component -> ComponentGen -> ComponentCache -> ComponentCache
+-- insertCache cId comp compGen (Just (opn, cache)) = Just (opn, Map.insert cId (Just comp, compGen) cache)
+-- insertCache _ _ _ Nothing = __IMPOSSIBLE__
 
 getOpenComponent :: Open Component -> SM Component
 getOpenComponent openComp = do
+  let comp = openThing openComp
   term <- getOpen $ compTerm <$> openComp
   typ <- getOpen $ compType <$> openComp
-  return Component{compTerm = term, compType = typ, compName = compName $ openThing openComp}
-
+  return Component
+    { compId = compId comp
+    , compName = compName comp
+    , compTerm = term
+    , compType = typ
+    , compCost = compCost comp}
 
 -- | Create a goal in the current environment
 mkGoal :: MonadTCEnv m => MetaId -> m Goal
@@ -352,16 +346,22 @@ mkGoalPreserveEnv goalLocalSource metaId = Goal
   , goalEnv = goalEnv goalLocalSource
   }
 
-mkComponent :: Maybe Name -> Term -> Type -> Component
-mkComponent name term typ = Component { compTerm = term, compType = typ, compName = name}
+mkComponent :: CompId -> Cost -> Maybe Name -> Term -> Type -> Component
+mkComponent cId cost mName term typ = Component { compId = cId, compName = mName, compTerm = term, compType = typ, compCost = cost }
 
-mkComponentN :: Name -> Term -> Type -> Component
-mkComponentN = mkComponent . Just
+mkComponentQ :: CompId -> Cost -> QName -> Term -> Type -> Component
+mkComponentQ cId cost qname = mkComponent cId cost (Just $ qnameName qname)
 
-mkComponentQ :: QName -> Term -> Type -> Component
-mkComponentQ = mkComponentN . qnameName
+noName :: Maybe Name
+noName = Nothing
 
-addBranchGoals :: [(Goal, ComponentCache)] -> SearchBranch -> SearchBranch
+newComponent :: MonadFresh CompId m => Cost -> Maybe Name -> Term -> Type -> m Component
+newComponent cost mName term typ = fresh <&> \cId -> mkComponent cId cost mName term typ
+
+newComponentQ :: MonadFresh CompId m => Cost -> QName -> Term -> Type -> m Component
+newComponentQ cost qname term typ = fresh <&> \cId -> mkComponent cId cost (Just $ qnameName qname) term typ
+
+addBranchGoals :: [Goal] -> SearchBranch -> SearchBranch
 addBranchGoals goals branch = branch {sbGoals = goals ++ sbGoals branch}
 
 withBranchState :: SearchBranch -> SM a -> SM a
@@ -372,14 +372,14 @@ withBranchState br ma = {- withEnv (sbTCEnv br) $ -} do
 withBranchAndGoal :: SearchBranch -> Goal -> SM a -> SM a
 withBranchAndGoal br goal ma = withEnv (goalEnv goal) $ withMetaId (goalMeta goal) $ withBranchState br ma
 
-nextBranchMeta' :: SearchBranch -> SM (Goal, ComponentCache, SearchBranch)
+nextBranchMeta' :: SearchBranch -> SM (Goal, SearchBranch)
 nextBranchMeta' = fmap (fromMaybe __IMPOSSIBLE__) . nextBranchMeta
 
-nextBranchMeta :: SearchBranch -> SM (Maybe (Goal, ComponentCache, SearchBranch))
+nextBranchMeta :: SearchBranch -> SM (Maybe (Goal, SearchBranch))
 nextBranchMeta branch = case sbGoals branch of
   [] -> return Nothing
-  ((goal, compCache) : goals) ->
-    return $ Just (goal, compCache, branch{sbGoals=goals})
+  (goal : goals) ->
+    return $ Just (goal, branch{sbGoals=goals})
 
 -- TODO: Rename (see metaInstantiation)
 getMetaInstantiation :: (MonadTCM tcm, PureTCM tcm, MonadDebug tcm, MonadInteractionPoints tcm, MonadFresh NameId tcm)
@@ -404,12 +404,13 @@ metaInstantiation metaId = lookupLocalMeta metaId <&> mvInstantiation >>= \case
 
 -- ^ NOTE: Collects components from the *current* context, not the context of
 -- the 'InteractionId'.
-collectComponents :: (MonadTCM tcm, ReadTCState tcm, HasConstInfo tcm, MonadFresh NameId tcm
-                     , MonadInteractionPoints tcm, MonadStConcreteNames tcm, PureTCM tcm, MonadError TCErr tcm)
-  => Options -> InteractionId -> Maybe QName -> MetaId -> tcm Components
-collectComponents opts ii mDefName metaId = do
+collectComponents :: ( MonadTCM tcm, ReadTCState tcm, HasConstInfo tcm, MonadFresh NameId tcm
+                     , MonadInteractionPoints tcm, MonadStConcreteNames tcm, PureTCM tcm
+                     , MonadError TCErr tcm, MonadFresh CompId tcm)
+  => Options -> Costs -> InteractionId -> Maybe QName -> MetaId -> tcm Components
+collectComponents opts costs ii mDefName metaId = do
   recVars <- collectRecVarCandidates ii
-  letVars <- getLetVars
+  letVars <- getLetVars (costLocal costs)
   let components = Components
         { hintFns = []
         , hintDataTypes = []
@@ -450,9 +451,10 @@ collectComponents opts ii mDefName metaId = do
     go comps qname = do
       info <- getConstInfo qname
       typ <- typeOfConst qname
+      cId <- fresh -- TODO: We generate this id even if it is not used
       case theDef info of
-        Axiom{} | isToLevel typ -> return comps{hintLevel = mkComponentQ qname (Def qname []) typ : hintLevel comps}
-                | shouldKeep -> return comps{hintAxioms = mkComponentQ qname (Def qname []) typ : hintAxioms comps}
+        Axiom{} | isToLevel typ -> return comps{hintLevel = mkComponentQ cId (costLevel costs) qname (Def qname []) typ : hintLevel comps}
+                | shouldKeep -> return comps{hintAxioms = mkComponentQ cId (costAxiom costs) qname (Def qname []) typ : hintAxioms comps}
                 | otherwise -> return comps
         -- TODO: Check if we want to use these
         DataOrRecSig{} -> return comps
@@ -464,23 +466,22 @@ collectComponents opts ii mDefName metaId = do
           return comps
         -- If the function is in the same mutual block, do not include it.
         f@Function{}
-          | Just qname == mDefName -> return comps{hintThisFn = Just $ mkComponentQ qname (Def qname []) typ}
+          | Just qname == mDefName -> return comps{hintThisFn = Just $ mkComponentQ cId noCost qname (Def qname []) typ}
           | isToLevel typ && isNotMutual qname f
-            -> return comps{hintLevel = mkComponentQ qname (Def qname []) typ : hintLevel comps}
+            -> return comps{hintLevel = mkComponentQ cId (costLevel costs) qname (Def qname []) typ : hintLevel comps}
           | isNotMutual qname f && shouldKeep -- TODO: Check if local to module or not
-            -> return comps{hintFns = mkComponentQ qname (Def qname []) typ : hintFns comps}
+            -> return comps{hintFns = mkComponentQ cId (costFn costs) qname (Def qname []) typ : hintFns comps}
           | otherwise -> return comps
-        Datatype{} -> return comps{hintDataTypes = mkComponentQ qname (Def qname []) typ : hintDataTypes comps}
+        Datatype{} -> return comps{hintDataTypes = mkComponentQ cId (costSet costs) qname (Def qname []) typ : hintDataTypes comps}
         Record{} -> do
-          -- TODO: remove dependency on qnameToTerm
-          projections <- catMaybes <$> (mapM qnameToComp =<< getRecordFields qname)
-          return comps{ hintRecordTypes = mkComponentQ qname (Def qname []) typ : hintRecordTypes comps
+          projections <- mapM (constructorToComponent (costSpeculateProj costs)) =<< getRecordFields qname
+          return comps{ hintRecordTypes = mkComponentQ cId (costSet costs) qname (Def qname []) typ : hintRecordTypes comps
                       , hintProjections = projections ++ hintProjections comps}
         -- We look up constructors when we need them
         Constructor{} -> return comps
         -- TODO: special treatment for primitives?
-        Primitive{} | isToLevel typ -> return comps{hintLevel = mkComponentQ qname (Def qname []) typ : hintLevel comps}
-                    | shouldKeep -> return comps{hintFns = mkComponentQ qname (Def qname []) typ : hintFns comps}
+        Primitive{} | isToLevel typ -> return comps{hintLevel = mkComponentQ cId (costLevel costs) qname (Def qname []) typ : hintLevel comps}
+                    | shouldKeep -> return comps{hintFns = mkComponentQ cId (costFn costs) qname (Def qname []) typ : hintFns comps}
                     | otherwise -> return comps
         PrimitiveSort{} -> do
           mlog $ "Collect: Primitive " ++ prettyShow (theDef info)
@@ -496,6 +497,15 @@ collectComponents opts ii mDefName metaId = do
       Def qname _ -> prettyShow qname == builtinLevelName
       _ -> False
 
+constructorToComponent :: (HasConstInfo tcm, ReadTCState tcm, MonadFresh CompId tcm, MonadTCM tcm)
+  => Cost -> QName -> tcm Component
+constructorToComponent cost qname = do
+  info <- getConstInfo qname
+  typ <- typeOfConst qname
+  case theDef info of
+    c@Constructor{} -> newComponentQ cost qname (Con (conSrcCon c) ConOCon []) typ
+    _ -> __IMPOSSIBLE__
+
 getEverythingInScope :: MonadTCM tcm => MetaVariable -> tcm [QName]
 getEverythingInScope metaVar = do
   let scope = clScope $ getMetaInfo metaVar
@@ -505,11 +515,15 @@ getEverythingInScope metaVar = do
   mlog $ "getEverythingInScope, scope = " ++ prettyShow scope
   return qnames
 
-getLetVars :: MonadTCM tcm => tcm [Open Component]
-getLetVars = map bindingToComp . Map.toAscList <$> asksTC envLetBindings
+getLetVars :: (MonadFresh CompId tcm, MonadTCM tcm, Monad tcm) => Cost -> tcm [Open Component]
+getLetVars cost = do
+  bindings <- asksTC envLetBindings
+  mapM makeComp $ Map.toAscList bindings
   where
-    bindingToComp :: (Name, Open (Term, Dom Type)) -> Open Component
-    bindingToComp (name, is) = (\(term, typ) -> mkComponentN name term (unDom typ)) <$> is
+    -- makeComp :: (Name, Open (Term, Dom Type)) -> tcm (Open Component)
+    makeComp (name, opn) = do
+      cId <- fresh
+      return $ (\(term, typ) -> mkComponent cId cost (Just name) term (unDom typ)) <$> opn
 
 builtinLevelName :: String
 builtinLevelName = "Agda.Primitive.Level"
@@ -662,12 +676,14 @@ runSearch options stopAfterFirst ii = withInteractionId ii $ do
           return [res]
         _ -> __IMPOSSIBLE__
     _ -> do
-      components <- collectComponents options ii mTheFunctionQName metaId
+      let costs = defaultCosts
+      components <- collectComponents options costs ii mTheFunctionQName metaId
       startGoals <- mapM mkGoal metaIds
       let startBranch = SearchBranch
             { sbTCState = state
-            , sbGoals = map (, emptyCompCache) startGoals
+            , sbGoals = startGoals
             , sbCost = 0
+            , sbCache = Map.empty
             , sbComponentsUsed = Map.empty
             }
 
@@ -678,7 +694,7 @@ runSearch options stopAfterFirst ii = withInteractionId ii $ do
             , searchTimeout = optTimeout options
             , searchTopMeta = metaId
             , searchTopEnv = env
-            , searchCosts = defaultCosts
+            , searchCosts = costs
             , searchStats = statsRef
             }
 
@@ -756,7 +772,7 @@ branchInstantiationDoc branch = withBranchState branch topInstantiationDoc
 
 refine :: SearchBranch -> SM [SearchStepResult]
 refine branch = withBranchState branch $ do
-  (goal, compCache, branch') <- nextBranchMeta' branch
+  (goal, branch') <- nextBranchMeta' branch
 
   reportDoc "mimer.refine" 20 $ "Refining goal" <+> pretty goal
 
@@ -783,40 +799,40 @@ refine branch = withBranchState branch $ do
 
           -- We reduce the meta type to WHNF(?) immediately to avoid refining it
           -- multiple times later (required e.g. to check if it is a Pi type)
-          results1 <- tryLocals     compCache goal' goalType' branch''
-          results2 <- tryDataRecord compCache goal' goalType' branch''
-          results3 <- tryLet        compCache goal' goalType' branch''
-          results4 <- tryProjs      compCache goal' goalType' branch''
-          results5 <- tryRecCall    compCache goal' goalType' branch''
-          results6 <- tryFns        compCache goal' goalType' branch''
-          results7 <- tryAxioms     compCache goal' goalType' branch''
+          results1 <- tryLocals     goal' goalType' branch''
+          results2 <- tryDataRecord goal' goalType' branch''
+          results3 <- tryLet        goal' goalType' branch''
+          results4 <- tryProjs      goal' goalType' branch''
+          results5 <- tryRecCall    goal' goalType' branch''
+          results6 <- tryFns        goal' goalType' branch''
+          results7 <- tryAxioms     goal' goalType' branch''
           let results = results1 ++ results2 ++ results3 ++ results4 ++ results5 ++ results6 ++ results7
           return results
 
-tryFns :: ComponentCache -> Goal -> Type -> SearchBranch -> SM [SearchStepResult]
-tryFns compCache goal goalType branch = withBranchAndGoal branch goal $ do
+tryFns :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
+tryFns goal goalType branch = withBranchAndGoal branch goal $ do
   reportDoc "mimer.refine.fn" 50 $ "Trying functions"
   fns <- asks (hintFns . searchComponents)
-  newBranches <- catMaybes <$> mapM (tryRefineAddMetas costFn compCache goal goalType branch) fns
+  newBranches <- catMaybes <$> mapM (tryRefineAddMetas costFn goal goalType branch) fns
   mapM checkSolved newBranches
 
-tryProjs :: ComponentCache -> Goal -> Type -> SearchBranch -> SM [SearchStepResult]
-tryProjs compCache goal goalType branch = withBranchAndGoal branch goal $ do
+tryProjs :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
+tryProjs goal goalType branch = withBranchAndGoal branch goal $ do
   projs <- asks (hintProjections . searchComponents)
-  newBranches <- catMaybes <$> mapM (tryRefineAddMetas costProj compCache goal goalType branch) projs
+  newBranches <- catMaybes <$> mapM (tryRefineAddMetas costProj goal goalType branch) projs
   mapM checkSolved newBranches
 
-tryAxioms :: ComponentCache -> Goal -> Type -> SearchBranch -> SM [SearchStepResult]
-tryAxioms compCache goal goalType branch = withBranchAndGoal branch goal $ do
+tryAxioms :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
+tryAxioms goal goalType branch = withBranchAndGoal branch goal $ do
   axioms <- asks (hintAxioms . searchComponents)
-  newBranches <- catMaybes <$> mapM (tryRefineAddMetas costAxiom compCache goal goalType branch) axioms
+  newBranches <- catMaybes <$> mapM (tryRefineAddMetas costAxiom goal goalType branch) axioms
   mapM checkSolved newBranches
 
-tryLet :: ComponentCache -> Goal -> Type -> SearchBranch -> SM [SearchStepResult]
-tryLet compCache goal goalType branch = withBranchAndGoal branch goal $ do
+tryLet :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
+tryLet goal goalType branch = withBranchAndGoal branch goal $ do
   letVars <- asks (hintLetVars . searchComponents) >>= mapM getOpenComponent
   mlog $ "Let vars: " ++ prettyShow letVars
-  newBranches <- catMaybes <$> mapM (tryRefineAddMetas costLet compCache goal goalType branch) letVars
+  newBranches <- catMaybes <$> mapM (tryRefineAddMetas costLet goal goalType branch) letVars
   mapM checkSolved newBranches
 
 -- | Returns @Right@ for normal lambda abstraction and @Left@ for absurd lambda.
@@ -857,20 +873,21 @@ tryLamAbs goal goalType branch =
         newMetaIds <- assignMeta (goalMeta goal) term goalType
 
         withEnv env $ do
-          branch' <- updateBranch emptyCompCache newMetaIds branch
+          branch' <- updateBranch newMetaIds branch
           goal' <- mkGoal metaId'
           tryLamAbs goal' bodyType branch'
     _ -> do
-      branch' <- updateBranch emptyCompCache [] branch -- TODO: Is this necessary?
+      branch' <- updateBranch [] branch -- TODO: Is this necessary?
       return $ Right (goal, goalType, branch')
 
 -- | NOTE: the MetaId should already be removed from the SearchBranch when this function is called
-tryLocals :: ComponentCache -> Goal -> Type -> SearchBranch -> SM [SearchStepResult]
-tryLocals compCache goal goalType branch = withBranchAndGoal branch goal $ do
-  localVars <- bench [Bench.Deserialization, Bench.Level] $ getLocalVars
+tryLocals :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
+tryLocals goal goalType branch = withBranchAndGoal branch goal $ do
+  cost <- asks (costLocal . searchCosts)
+  localVars <- bench [Bench.Deserialization, Bench.Level] $ getLocalVars cost
   -- TODO: Explain permute
   let localVars' = localVars -- permute (takeP (length localVars) $ mvPermutation metaVar) localVars
-  newBranches <- catMaybes <$> mapM (tryRefineAddMetas costLocal compCache goal goalType branch) localVars'
+  newBranches <- catMaybes <$> mapM (tryRefineAddMetas costLocal goal goalType branch) localVars'
   mapM checkSolved newBranches
 
 -- NEXT:
@@ -878,11 +895,12 @@ tryLocals compCache goal goalType branch = withBranchAndGoal branch goal $ do
 -- 2. Lenses
 -- 3. Caching
 
-tryRecCall :: ComponentCache -> Goal -> Type -> SearchBranch -> SM [SearchStepResult]
-tryRecCall compCache goal goalType branch = asks (hintThisFn . searchComponents) >>= \case
+tryRecCall :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
+tryRecCall goal goalType branch = asks (hintThisFn . searchComponents) >>= \case
   Nothing -> return []
   Just thisFn -> withBranchAndGoal branch goal $ do
-    localVars <- bench [Bench.Deserialization, Bench.Level] $ getLocalVars
+    localCost <- asks (costLocal . searchCosts)
+    localVars <- bench [Bench.Deserialization, Bench.Level] $ getLocalVars localCost
     recCand <- asks (hintRecVars . searchComponents) >>= getOpen
     let recCandidates = filter (\t -> case compTerm t of v@Var{} -> v `elem` recCand; _ -> False) localVars
     reportSDoc "mimer.refine.rec" 60 $ ("Argument candidates for recursive call:" <+>) <$> prettyTCM recCandidates
@@ -895,13 +913,14 @@ tryRecCall compCache goal goalType branch = asks (hintThisFn . searchComponents)
         (goal', branch') <- ensureNoOccursCheck goal branch
         -- Apply the recursive call to new metas
         (thisFnTerm', thisFnType, newMetas) <- applyToMetas 0 (compTerm thisFn) (compType thisFn)
-        let thisFnComp = mkComponent (compName thisFn) thisFnTerm' thisFnType
+        -- TODO: Good idea to use noCost here? The actual cost is added later for now.
+        thisFnComp <- newComponent noCost (compName thisFn) thisFnTerm' thisFnType
         -- Newly created metas must be stored in the branch state
-        branch'' <- updateBranch compCache [] branch'
+        branch'' <- updateBranch [] branch'
 
         reportSDoc "mimer.refine.rec" 60 $ return ("Recursive call component:" <+> pretty thisFnComp)
         -- Try using the recursive call
-        tryRefineWith costRecCall compCache goal' goalType branch'' thisFnComp >>= \case
+        tryRefineWith costRecCall goal' goalType branch'' thisFnComp >>= \case
           -- Recursive call failed
           Nothing -> do
             reportSMDoc "mimer.refine.rec" 60 $ "Assigning the recursive call failed"
@@ -913,9 +932,9 @@ tryRecCall compCache goal goalType branch = asks (hintThisFn . searchComponents)
             let fillArg g = do
                   gType <- getMetaTypeInContext (goalMeta g)
                   reportSDoc "mimer.refine.rec" 60 $ return ("Arg " <+> pretty (goalMeta g) <+> ":" <+> pretty gType)
-                  let remainingArgGoals = map (, compCache) $ argGoals \\ [g]
+                  let remainingArgGoals = argGoals \\ [g]
                   r <- catMaybes <$> mapM (\recCandidate -> do
-                     mbr <- tryRefineWith (const 0) compCache g gType branch''' recCandidate
+                     mbr <- tryRefineWith (const 0) g gType branch''' recCandidate
                      return $ fmap (\br -> br{sbGoals = remainingArgGoals ++ sbGoals br}) mbr
                      ) recCandidates
                   reportSDoc "mimer.refine.rec" 60 $ return ("Possibilities: " <+> pretty (length r))
@@ -941,13 +960,13 @@ tryRecCall compCache goal goalType branch = asks (hintThisFn . searchComponents)
       (newMetaId, newMetaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq goalType
       assignV DirLeq (goalMeta goal) metaArgs newMetaTerm (AsTermsOf goalType)
       reportDoc "mimer.refine.rec" 60 $ "Instantiating meta-variable (" <> pretty (goalMeta goal) <> ") with a new one with DontRunMetaOccursCheck (" <> pretty newMetaId <> ")"
-      branch' <- updateBranch compCache [] branch
+      branch' <- updateBranch [] branch
       return (goal{goalMeta = newMetaId}, branch')
 
 
 -- TODO: Factor out `checkSolved`
-tryDataRecord :: ComponentCache -> Goal -> Type -> SearchBranch -> SM [SearchStepResult]
-tryDataRecord compCache goal goalType branch = withBranchAndGoal branch goal $ do
+tryDataRecord :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
+tryDataRecord goal goalType branch = withBranchAndGoal branch goal $ do
   -- TODO: There is a `isRecord` function, which performs a similar case
   -- analysis as here, but it does not work for data types.
   case unEl goalType of
@@ -1002,24 +1021,24 @@ tryDataRecord compCache goal goalType branch = withBranchAndGoal branch goal $ d
           cName = conName cHead
           cTerm = Con cHead ConOSystem []
       cType <- typeOfConst cName
-      let comp = mkComponentQ (conName cHead) cTerm cType
+      cost <- asks (costRecordCon . searchCosts) -- TODO: Use lenses for this?
+      comp <- newComponentQ cost cName cTerm cType
       -- -- NOTE: at most 1
-      newBranches <- maybeToList <$> tryRefineAddMetasSkip costRecordCon (recPars recordDefn) compCache goal goalType branch comp
+      newBranches <- maybeToList <$> tryRefineAddMetasSkip costRecordCon (recPars recordDefn) goal goalType branch comp
       mapM checkSolved newBranches
 
     tryData :: Defn -> SM [SearchStepResult]
     tryData dataDefn = do
-      -- Get the constructors as [(Term, Type)]
-      -- TODO: prioritize constructors with few arguments. E.g. @sortOn (artity . snd)@
-      comps <- mapM (fmap (fromMaybe __IMPOSSIBLE__) . qnameToComp) (dataCons dataDefn)
-      newBranches <- mapM (tryRefineAddMetas costDataCon compCache goal goalType branch) comps
+      cost <- asks (costDataCon . searchCosts)
+      comps <- mapM (constructorToComponent cost) $ dataCons dataDefn
+      newBranches <- mapM (tryRefineAddMetas costDataCon goal goalType branch) comps
       -- TODO: Reduce overlap between e.g. tryLocals, this and tryRecord
       mapM checkSolved (catMaybes newBranches)
 
     tryLevel :: SM [SearchStepResult]
     tryLevel = do
       levelHints <- asks (hintLevel . searchComponents)
-      newBranches <- catMaybes <$> mapM (tryRefineAddMetas costLevel compCache goal goalType branch) levelHints
+      newBranches <- catMaybes <$> mapM (tryRefineAddMetas costLevel goal goalType branch) levelHints
       mapM checkSolved newBranches
 
     -- TODO: Add an extra filtering on the sort
@@ -1027,7 +1046,10 @@ tryDataRecord compCache goal goalType branch = withBranchAndGoal branch goal $ d
     trySet level = do
       setTerm <- bench [Bench.Deserialization, Bench.Reduce] $ reduce level >>= \case
         reducedLevel@(Max i [])
-          | i > 0 -> return [mkComponent Nothing (Sort $ Type $ Max (i-1) []) goalType]
+          | i > 0 -> do
+              cost <- asks (costSet . searchCosts)
+              comp <- newComponent cost Nothing (Sort $ Type $ Max (i-1) []) goalType
+              return [comp]
           | otherwise -> do
               mlog $ "trySet: don't know what to do with level " ++ prettyShow reducedLevel
               return []
@@ -1035,7 +1057,7 @@ tryDataRecord compCache goal goalType branch = withBranchAndGoal branch goal $ d
           mlog $ "trySet: don't know what to do with " ++ prettyShow reducedLevel
           return []
       components <- asks searchComponents
-      newBranches <- catMaybes <$> mapM (tryRefineAddMetas costSet compCache goal goalType branch)
+      newBranches <- catMaybes <$> mapM (tryRefineAddMetas costSet goal goalType branch)
                       (setTerm ++ concatMap ($ components)
                        [ hintDataTypes
                        , hintRecordTypes
@@ -1045,8 +1067,8 @@ tryDataRecord compCache goal goalType branch = withBranchAndGoal branch goal $ d
 -- | Type should already be reduced here
 -- NOTE: Does not reset the state!
 -- TODO: Make sure the type is always reduced
-tryRefineWith :: (Costs -> Int) -> ComponentCache -> Goal -> Type -> SearchBranch -> Component -> SM (Maybe SearchBranch)
-tryRefineWith costFn compCache goal goalType branch comp = withBranchAndGoal branch goal $ do
+tryRefineWith :: (Costs -> Cost) -> Goal -> Type -> SearchBranch -> Component -> SM (Maybe SearchBranch)
+tryRefineWith costFn goal goalType branch comp = withBranchAndGoal branch goal $ do
   reportSMDoc "mimer.refine" 50 $ do
     cxt <- getContextTelescope >>= prettyTCM
     hi <- prettyTCM $ compTerm comp
@@ -1064,22 +1086,24 @@ tryRefineWith costFn compCache goal goalType branch comp = withBranchAndGoal bra
       mlog $ "  New metas (tryRefineWith): " ++ prettyShow newMetaIds'
 
       reportSMDoc "mimer.refine" 50 $ "Refinement succeeded"
-      Just <$> updateBranchCost costFn comp (rmCache' (compName comp) $ compCache) newMetaIds' branch
+      Just <$> updateBranchCost costFn comp newMetaIds' branch
     (False, _) -> do
       reportSMDoc "mimer.refine" 50 $ "Refinement failed"
       return Nothing
 
+
 -- TODO: Make policy for when state should be put
-tryRefineAddMetasSkip :: (Costs -> Int) -> Nat -> ComponentCache -> Goal -> Type -> SearchBranch -> Component -> SM (Maybe SearchBranch)
-tryRefineAddMetasSkip costFn skip compCache goal goalType branch comp = withBranchAndGoal branch goal $ do
+tryRefineAddMetasSkip :: (Costs -> Cost) -> Nat -> Goal -> Type -> SearchBranch -> Component -> SM (Maybe SearchBranch)
+tryRefineAddMetasSkip costFn skip goal goalType branch comp = withBranchAndGoal branch goal $ do
   -- Apply the hint to new metas (generating @c@, @c ?@, @c ? ?@, etc.)
   -- TODO: Where is the best pace to reduce the hint type?
   (hintTerm', hintType', newMetas) <- applyToMetas skip (compTerm comp) =<< reduce (compType comp)
-  let comp' = mkComponent (compName comp) hintTerm' hintType'
-  branch' <- updateBranch (rmCache' (compName comp) compCache) [] branch
-  fmap (addBranchGoals $ map ((,compCache) . mkGoalPreserveEnv goal) $ reverse newMetas) <$> tryRefineWith costFn compCache goal goalType branch' comp'
+  newMetaCost <- asks (costNewMeta . searchCosts)
+  comp' <- newComponent (compCost comp + newMetaCost * length newMetas) (compName comp) hintTerm' hintType'
+  branch' <- updateBranch [] branch
+  fmap (addBranchGoals $ map (mkGoalPreserveEnv goal) $ reverse newMetas) <$> tryRefineWith costFn goal goalType branch' comp'
 
-tryRefineAddMetas :: (Costs -> Int) -> ComponentCache -> Goal -> Type -> SearchBranch -> Component -> SM (Maybe SearchBranch)
+tryRefineAddMetas :: (Costs -> Cost) ->  Goal -> Type -> SearchBranch -> Component -> SM (Maybe SearchBranch)
 tryRefineAddMetas costFn = tryRefineAddMetasSkip costFn 0
 
 -- TODO: Make sure the type is reduced the first time this is called
@@ -1114,7 +1138,7 @@ checkSolved branch = {-# SCC "custom-checkSolved" #-} bench [Bench.Deserializati
   env <- asks searchTopEnv
   withBranchState branch $ withEnv env $ do
     openMetas <- getOpenMetas
-    case filter ((`elem` openMetas) . goalMeta . fst) (sbGoals branch) of
+    case filter ((`elem` openMetas) . goalMeta) (sbGoals branch) of
       [] -> do
         metaId <- asks searchTopMeta
         mlog =<< ("checkSolved: context=" ++) . prettyShow <$> getContext
@@ -1126,8 +1150,8 @@ checkSolved branch = {-# SCC "custom-checkSolved" #-} bench [Bench.Deserializati
             return (ResultExpr e)
       remainingGoals -> return $ OpenBranch branch{sbGoals = remainingGoals}
 
-updateBranch' :: Maybe (Costs -> Int, Component) -> ComponentCache -> [MetaId] -> SearchBranch -> SM SearchBranch
-updateBranch' costs compCache newMetaIds branch = do
+updateBranch' :: Maybe (Costs -> Cost, Component) -> [MetaId] -> SearchBranch -> SM SearchBranch
+updateBranch' costs newMetaIds branch = do
   state <- getTC
   let compsUsed = sbComponentsUsed branch
   (deltaCost, compsUsed') <- case costs of
@@ -1140,18 +1164,17 @@ updateBranch' costs compCache newMetaIds branch = do
               Nothing -> return (cost1, Map.insert name 1 compsUsed)
               -- TODO: Currently using: uses^2+1 as cost. Make a parameter?
               Just uses -> return (cost1 + uses * uses + 2, Map.adjust succ name compsUsed)
-  newGoals <- mapM (fmap (,compCache) . mkGoal) newMetaIds
+  newGoals <- mapM mkGoal newMetaIds
   return branch{ sbTCState = state
                , sbGoals = newGoals ++ sbGoals branch
                , sbCost = sbCost branch + deltaCost
                , sbComponentsUsed = compsUsed'
                }
 
-updateBranch :: ComponentCache -- ^ Cache to use for new goals
-  -> [MetaId] -> SearchBranch -> SM SearchBranch
+updateBranch :: [MetaId] -> SearchBranch -> SM SearchBranch
 updateBranch = updateBranch' Nothing
 
-updateBranchCost :: (Costs -> Int) -> Component -> ComponentCache -> [MetaId] -> SearchBranch -> SM SearchBranch
+updateBranchCost :: (Costs -> Cost) -> Component -> [MetaId] -> SearchBranch -> SM SearchBranch
 updateBranchCost costFn comp = updateBranch' $ Just (costFn, comp)
 
 assignMeta :: MetaId -> Term -> Type -> SM [MetaId]
@@ -1205,28 +1228,29 @@ bench k ma = billTo (Bench.Deserialization:k) ma
 -- getContextArgs :: (Applicative m, MonadTCEnv m) => m Args
 -- getContextTelescope :: (Applicative m, MonadTCEnv m) => m Telescope
 -- getContextTerms :: (Applicative m, MonadTCEnv m) => m [Term]
-getLocalVars :: MonadTCM tcm => tcm [Component]
-getLocalVars = do
+getLocalVars :: (MonadTCM tcm, MonadFresh CompId tcm)
+  => Cost -> tcm [Component]
+getLocalVars cost = do
   contextTerms <- getContextTerms
   contextTypes <- map unDom . flattenTel <$> getContextTelescope
   unless (length contextTerms == length contextTypes)
          (mlog $ "WARNING: length mismatch in getLocalVars: " ++ prettyShow contextTerms ++ "; " ++ prettyShow contextTypes)
-  return $ zipWith (mkComponent Nothing) contextTerms contextTypes
+  zipWithM (newComponent cost noName) contextTerms contextTypes
 
 prettyBranch :: SearchBranch -> SM String
 prettyBranch branch = withBranchState branch $ do
-    metas <- prettyTCM (map (goalMeta . fst) $ sbGoals branch)
+    metas <- prettyTCM $ map goalMeta (sbGoals branch)
     metaId <- asks searchTopMeta
     inst <- getMetaInstantiation metaId
     instStr <- prettyTCM inst
     let compUses = pretty $ Map.toList $ sbComponentsUsed branch
     return $ render $ text "Branch{cost: " <> text (show $ sbCost branch) <> ", metas: " <> metas <> text " , instantiation: " <> pretty metaId <> text " = " <> instStr <> text ", used components: " <> compUses <> text "}"
 
-instance Pretty ComponentCache where
-  pretty cache = keyValueList
-    [ ("ccLocalVars",  pretty $ map fst . snd <$> ccLocalVars cache)
-    , ("ccComponents", pretty $ map (mapSnd fst) . Map.toList . snd <$> ccComponents cache)
-    ]
+-- instance Pretty ComponentCache where
+--   pretty cache = keyValueList
+--     [ ("ccLocalVars",  pretty $ map fst . snd <$> ccLocalVars cache)
+--     , ("ccComponents", pretty $ map (mapSnd fst) . Map.toList . snd <$> ccComponents cache)
+--     ]
 
 instance Pretty Goal where
   pretty goal = keyValueList
@@ -1237,7 +1261,7 @@ instance Pretty Goal where
 instance Pretty SearchBranch where
   pretty branch = keyValueList
     [ ("sbTCState", "[...]")
-    , ("sbGoals", pretty $ map snd $ sbGoals branch)
+    , ("sbGoals", pretty $ sbGoals branch)
     , ("sbCost", pretty $ sbCost branch)
     , ("sbComponentsUsed", pretty $ sbComponentsUsed branch)
     ]
@@ -1287,10 +1311,12 @@ instance Pretty SearchOptions where
 
 instance Pretty Component where
   pretty comp = haskellRecord "Component"
-    [ ("compName", pretty $ compName comp)
+    [ ("compId", pretty $ compId comp)
     , ("compTerm", pretty $ compTerm comp)
     , ("compType", pretty $ compType comp)
+    , ("compCost", pretty $ compCost comp)
     ]
+
 
 instance Pretty Costs where
   pretty costs = align 20 entries
@@ -1311,10 +1337,9 @@ instance Pretty Costs where
 
 instance PrettyTCM Component where
   prettyTCM comp = do
-    name <- maybe (return "_") prettyTCM $ compName comp
     term <- prettyTCM $ compTerm comp
     typ <- prettyTCM $ compType comp
-    return $ name <> "=" <> term <> ":" <> typ
+    return $ pretty (compId comp) <> "=" <> term <> ":" <> typ
 
 
 -- TODO: Not used but keep it around for debug printing
