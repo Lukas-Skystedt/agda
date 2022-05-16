@@ -1,6 +1,6 @@
 module Agda.Mimer.Debug where
 
-import Data.IORef (IORef, writeIORef, readIORef, newIORef)
+import Data.IORef (IORef, writeIORef, readIORef, newIORef, modifyIORef')
 import System.IO.Unsafe (unsafePerformIO)
 import Control.Monad (when)
 
