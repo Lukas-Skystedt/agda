@@ -15,7 +15,9 @@ import Data.Functor ((<&>))
 import Data.List (sortOn, intersect, transpose, (\\))
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Maybe (maybeToList, fromMaybe, maybe)
+import Data.Set (Set)
+import qualified Data.Set as Set
+import Data.Maybe (maybeToList, fromMaybe, maybe, isNothing)
 import Data.PQueue.Min (MinQueue)
 import qualified Data.PQueue.Min as Q
 import Data.Time.Clock (diffUTCTime, getCurrentTime, secondsToNominalDiffTime)
@@ -26,7 +28,7 @@ import qualified Text.PrettyPrint.Boxes as Box
 import qualified Agda.Benchmarking as Bench
 import Agda.Syntax.Abstract (Expr(AbsurdLam))
 import Agda.Syntax.Abstract.Name (QName(..), Name(..))
-import Agda.Syntax.Common (InteractionId, MetaId(..), ArgInfo(..), defaultArgInfo, Origin(..), ConOrigin(..), Hiding(..), setOrigin, NameId, Nat, namedThing, unArg)
+import Agda.Syntax.Common (InteractionId, MetaId(..), ArgInfo(..), defaultArgInfo, Origin(..), ConOrigin(..), Hiding(..), setOrigin, NameId, Nat, namedThing, Arg(..), setHiding)
 import Agda.Syntax.Info (exprNoRange)
 import Agda.Syntax.Internal -- (Type, Type''(..), Term(..), Dom'(..), Abs(..), arity , ConHead(..), Sort'(..), Level, argFromDom, Level'(..), absurdBody, Dom, namedClausePats, Pattern'(..), dbPatVarIndex)
 import Agda.Syntax.Internal.MetaVars (AllMetas(..))
@@ -40,6 +42,7 @@ import Agda.TypeChecking.Free (flexRigOccurrenceIn)
 import Agda.TypeChecking.MetaVars (newValueMeta)
 import Agda.TypeChecking.Monad -- (MonadTCM, lookupInteractionId, getConstInfo, liftTCM, clScope, getMetaInfo, lookupMeta, MetaVariable(..), metaType, typeOfConst, getMetaType, MetaInfo(..), getMetaTypeInContext)
 import Agda.TypeChecking.Pretty (MonadPretty, prettyTCM, PrettyTCM(..))
+import Agda.TypeChecking.Records (isRecord)
 import Agda.TypeChecking.Reduce (reduce, instantiateFull)
 import Agda.TypeChecking.Rules.Term  (lambdaAddContext)
 import Agda.TypeChecking.Substitute.Class (apply)
@@ -118,7 +121,7 @@ data SearchBranch = SearchBranch
   { sbTCState :: TCState
   , sbGoals :: [Goal]
   , sbCost :: Int
-  , sbCache :: Map Substitution ComponentCache
+  , sbCache :: Map Telescope ComponentCache
   , sbComponentsUsed :: Map Name Int -- ^ Number of times each component has been used
   }
   deriving (Generic)
@@ -132,15 +135,17 @@ instance Eq SearchBranch where
 instance Ord SearchBranch where
   compare = compare `on` sbCost
 
-data ComponentGen = ComponentDone Component
-                  | NeedsArg Type (Term -> ComponentGen)
-  deriving (Generic)
+-- | List of names of projections used
+type ComponentGen = [QName]
+-- data ComponentGen = ComponentDone Component
+--                   | NeedsArg Type (Term -> ComponentGen)
+--   deriving (Generic)
 
-instance NFData ComponentGen
+-- instance NFData ComponentGen
 
 
 -- | The @Open ()@ is for keeping track of the context in which the components are valid
-type ComponentCache = (Open (), Map CompId (Maybe Component, ComponentGen))
+type ComponentCache = (CheckpointId, Map CompId (Maybe Component, ComponentGen))
 
 data Goal = Goal
   { goalMeta :: MetaId
@@ -181,6 +186,7 @@ data Component = Component
   , compName :: Maybe Name -- ^ Used for keeping track of how many times a component has been used
   , compTerm :: Term
   , compType :: Type
+  , compMetas :: [MetaId]
   , compCost :: Cost
   }
   deriving (Eq, Generic)
@@ -202,6 +208,7 @@ data SearchOptions = SearchOptions
   , searchTimeout :: MilliSeconds
   , searchTopMeta :: MetaId
   , searchTopEnv :: TCEnv
+  , searchTopCheckpoint :: CheckpointId
   , searchCosts :: Costs
   , searchStats :: IORef MimerStats
   }
@@ -324,12 +331,15 @@ getOpenComponent openComp = do
   let comp = openThing openComp
   term <- getOpen $ compTerm <$> openComp
   typ <- getOpen $ compType <$> openComp
+  when (not $ null $ compMetas comp) __IMPOSSIBLE__
   return Component
     { compId = compId comp
     , compName = compName comp
     , compTerm = term
     , compType = typ
-    , compCost = compCost comp}
+    , compMetas = compMetas comp
+    , compCost = compCost comp
+    }
 
 -- | Create a goal in the current environment
 mkGoal :: MonadTCEnv m => MetaId -> m Goal
@@ -346,20 +356,21 @@ mkGoalPreserveEnv goalLocalSource metaId = Goal
   , goalEnv = goalEnv goalLocalSource
   }
 
-mkComponent :: CompId -> Cost -> Maybe Name -> Term -> Type -> Component
-mkComponent cId cost mName term typ = Component { compId = cId, compName = mName, compTerm = term, compType = typ, compCost = cost }
+mkComponent :: CompId -> [MetaId] -> Cost -> Maybe Name -> Term -> Type -> Component
+mkComponent cId metaIds cost mName term typ = Component
+  { compId = cId, compName = mName, compTerm = term, compType = typ, compMetas = metaIds, compCost = cost }
 
 mkComponentQ :: CompId -> Cost -> QName -> Term -> Type -> Component
-mkComponentQ cId cost qname = mkComponent cId cost (Just $ qnameName qname)
+mkComponentQ cId cost qname = mkComponent cId [] cost (Just $ qnameName qname)
 
 noName :: Maybe Name
 noName = Nothing
 
-newComponent :: MonadFresh CompId m => Cost -> Maybe Name -> Term -> Type -> m Component
-newComponent cost mName term typ = fresh <&> \cId -> mkComponent cId cost mName term typ
+newComponent :: MonadFresh CompId m => [MetaId] -> Cost -> Maybe Name -> Term -> Type -> m Component
+newComponent metaIds cost mName term typ = fresh <&> \cId -> mkComponent cId metaIds cost mName term typ
 
-newComponentQ :: MonadFresh CompId m => Cost -> QName -> Term -> Type -> m Component
-newComponentQ cost qname term typ = fresh <&> \cId -> mkComponent cId cost (Just $ qnameName qname) term typ
+newComponentQ :: MonadFresh CompId m => [MetaId] -> Cost -> QName -> Term -> Type -> m Component
+newComponentQ metaIds cost qname term typ = fresh <&> \cId -> mkComponent cId metaIds cost (Just $ qnameName qname) term typ
 
 addBranchGoals :: [Goal] -> SearchBranch -> SearchBranch
 addBranchGoals goals branch = branch {sbGoals = goals ++ sbGoals branch}
@@ -474,7 +485,7 @@ collectComponents opts costs ii mDefName metaId = do
           | otherwise -> return comps
         Datatype{} -> return comps{hintDataTypes = mkComponentQ cId (costSet costs) qname (Def qname []) typ : hintDataTypes comps}
         Record{} -> do
-          projections <- mapM (constructorToComponent (costSpeculateProj costs)) =<< getRecordFields qname
+          projections <- mapM (qnameToComponent (costSpeculateProj costs)) =<< getRecordFields qname
           return comps{ hintRecordTypes = mkComponentQ cId (costSet costs) qname (Def qname []) typ : hintRecordTypes comps
                       , hintProjections = projections ++ hintProjections comps}
         -- We look up constructors when we need them
@@ -497,14 +508,23 @@ collectComponents opts costs ii mDefName metaId = do
       Def qname _ -> prettyShow qname == builtinLevelName
       _ -> False
 
-constructorToComponent :: (HasConstInfo tcm, ReadTCState tcm, MonadFresh CompId tcm, MonadTCM tcm)
+qnameToComponent :: (HasConstInfo tcm, ReadTCState tcm, MonadFresh CompId tcm, MonadTCM tcm)
   => Cost -> QName -> tcm Component
-constructorToComponent cost qname = do
+qnameToComponent cost qname = do
   info <- getConstInfo qname
   typ <- typeOfConst qname
-  case theDef info of
-    c@Constructor{} -> newComponentQ cost qname (Con (conSrcCon c) ConOCon []) typ
-    _ -> __IMPOSSIBLE__
+  let term = case theDef info of
+        Axiom{} -> Def qname []
+        DataOrRecSig{} -> __IMPOSSIBLE__
+        GeneralizableVar -> Def qname []
+        AbstractDefn{} -> __IMPOSSIBLE__
+        Function{} -> Def qname []
+        Datatype{} -> Def qname []
+        Record{} -> Def qname []
+        c@Constructor{} -> Con (conSrcCon c) ConOCon []
+        Primitive{} -> Def qname []
+        PrimitiveSort{} -> Def qname []
+  newComponentQ [] cost qname term typ
 
 getEverythingInScope :: MonadTCM tcm => MetaVariable -> tcm [QName]
 getEverythingInScope metaVar = do
@@ -523,7 +543,7 @@ getLetVars cost = do
     -- makeComp :: (Name, Open (Term, Dom Type)) -> tcm (Open Component)
     makeComp (name, opn) = do
       cId <- fresh
-      return $ (\(term, typ) -> mkComponent cId cost (Just name) term (unDom typ)) <$> opn
+      return $ (\(term, typ) -> mkComponent cId [] cost (Just name) term (unDom typ)) <$> opn
 
 builtinLevelName :: String
 builtinLevelName = "Agda.Primitive.Level"
@@ -577,7 +597,12 @@ collectRecVarCandidates ii = do
       IApplyP{} -> [] -- Only for Cubical?
       DefP{} -> [] -- Only for Cubical?
 
-
+runComponentGen :: ComponentGen -> SM Component
+runComponentGen = undefined
+-- runComponentGen (ComponentDone comp) = return comp
+-- runComponentGen (NeedsArg typ f) = do
+--   let arg = undefined typ
+--   runComponentGen (f arg)
 
 
 ------------------------------------------------------------------------------
@@ -588,20 +613,22 @@ data MimerStats = MimerStats
   , statCompGen :: Nat -- ^ Could use a generator for a component
   , statCompRegen :: Nat -- ^ Had to regenerate the cache (new context)
   , statCompNoRegen :: Nat -- ^ Did not have to regenerate the cache
+  , statMetasCreated :: Nat -- ^ Total number of meta-variables created explicitly (not through unification)
   } deriving (Show, Eq, Generic)
 instance NFData MimerStats
 
 emptyMimerStats :: MimerStats
-emptyMimerStats = MimerStats{statCompHit = 0, statCompGen = 0, statCompRegen = 0, statCompNoRegen = 0}
+emptyMimerStats = MimerStats{statCompHit = 0, statCompGen = 0, statCompRegen = 0, statCompNoRegen = 0, statMetasCreated = 0}
 
-incCompHit, incCompGen, incCompRegen, incCompNoRegen :: MimerStats -> MimerStats
+incCompHit, incCompGen, incCompRegen, incCompNoRegen, incMetasCreated :: MimerStats -> MimerStats
 incCompHit     stats = stats {statCompHit = succ $ statCompHit stats}
 incCompGen     stats = stats {statCompGen = succ $ statCompGen stats}
 incCompRegen   stats = stats {statCompRegen = succ $ statCompRegen stats}
 incCompNoRegen stats = stats {statCompNoRegen = succ $ statCompNoRegen stats}
+incMetasCreated stats = stats {statMetasCreated = succ $ statMetasCreated stats}
 
-updateCacheStat :: (MimerStats -> MimerStats) -> SM ()
-updateCacheStat f = verboseS "mimer.stats" 1 $ do
+updateStat :: (MimerStats -> MimerStats) -> SM ()
+updateStat f = verboseS "mimer.stats" 1 $ do
   ref <- asks searchStats
   liftIO $ modifyIORef' ref f
 
@@ -688,12 +715,14 @@ runSearch options stopAfterFirst ii = withInteractionId ii $ do
             }
 
       statsRef <- liftIO $ newIORef emptyMimerStats
+      checkpoint <- viewTC eCurrentCheckpoint
       let searchOptions = SearchOptions
             { searchComponents = components
             , searchHintMode = optHintMode options
             , searchTimeout = optTimeout options
             , searchTopMeta = metaId
             , searchTopEnv = env
+            , searchTopCheckpoint = checkpoint
             , searchCosts = costs
             , searchStats = statsRef
             }
@@ -752,7 +781,151 @@ runSearch options stopAfterFirst ii = withInteractionId ii $ do
         reportSLn "mimer.search" 20 $ "Search ended after " ++ show (nrSteps + 1) ++ " cycles"
         solStrs <- mapM showTCM sols
         reportSLn "mimer.search" 15 $ "Solutions found: " ++ prettyShow solStrs
+        let q = do
+              ref <- asks searchStats
+              stats <- liftIO $ readIORef ref
+              return $ "Statistics:" <+> text (show stats)
+
+        reportSMDoc "mimer.stats" 10 $ (q :: SM Doc)
         return solStrs
+
+prepareComponents :: Goal -> SearchBranch -> SM (SearchBranch, [Component])
+prepareComponents goal branch = withBranchAndGoal branch goal $ do
+  cxtTel <- getContextTelescope
+  case Map.lookup cxtTel (sbCache branch) of
+    Nothing -> do
+      updateStat incCompRegen
+      reportDoc "mimer.components" 20 $ "No cache found for current context" <+> parens (pretty cxtTel) <+> ". Generating one."
+      -- Generate components for this context
+      componentsWithGen <- genComponents
+      reportDoc "mimer.components" 20 $ "Generated cache with" <+> pretty (length componentsWithGen) <+> "components"
+      checkpoint <- viewTC eCurrentCheckpoint
+      let components = map fst componentsWithGen
+          cache = (checkpoint, Map.fromList $ map (\(c,g) -> (compId c, (Just c, g))) componentsWithGen)
+          newSbCache = Map.insert cxtTel cache (sbCache branch)
+      -- Update the branch because state has new meta-variables
+      branch' <- updateBranch [] branch{sbCache=newSbCache}
+      return (branch', components)
+    Just (checkpoint, cache) -> do
+      updateStat incCompNoRegen
+      reportDoc "mimer.components" 20 $ "Cache found for current context" <+> parens (pretty cxtTel)
+      verboseS "mimer.sanity" 10 $ do
+        subst <- checkpointSubstitution checkpoint
+        unless (subst == IdS) $ reportDoc "mimer.sanity" 10 $
+          "WARNING! Substitution should be identity, but was " <+> pretty subst
+          <+> "when accessing cache for context" <+> pretty cxtTel
+      -- TODO:
+      -- Traverse the map, regenerating components as needed
+
+      components <- mapM (\case
+                             (Nothing, gen) -> runComponentGen gen
+                             (Just comp, _) -> return comp) (Map.elems cache)
+      -- Update the branch because state has new meta-variables
+      branch' <- updateBranch [] branch
+      return (branch', components)
+
+
+genComponents :: SM [(Component, ComponentGen)]
+genComponents = do
+  cost <- asks (costLocal . searchCosts)
+  localVars <- getLocalVars cost
+  concatMapM (genComponentsFrom True) localVars
+
+genComponentsFrom :: Bool -- ^ Apply record elimination
+                  -> Component
+                  -> SM [(Component, ComponentGen)]
+genComponentsFrom False comp = do
+  comp <- applyToMetasG 0 Nothing comp
+  return [(comp,[])]
+genComponentsFrom appRecElims origComp = go Set.empty origComp
+  where
+  -- We keep a set of recursive records that we have already "seen" to avoid looping
+  go :: Set QName -> Component -> SM [(Component, ComponentGen)]
+  go seenRecords comp = do
+    comp' <- applyToMetasG 0 Nothing comp
+    projComps <- case unEl (compType comp') of
+      Def qname elims
+        | Set.member qname seenRecords -> do
+            reportDoc "mimer.components" 60 $
+              "Skipping projection because recursive record already seen: " <+> pretty qname
+            return []
+        | otherwise -> isRecord qname >>= \case
+          Nothing -> return [(comp', [])]
+          Just defn -> do
+            -- TODO: Is there a better way to check if a record is recursive? There is a recMutual field
+            reportDoc "mimer.temp" 10 $ "Record recursive?" <+> pretty qname <+> ( if isNothing $ recInduction defn then "no" else "yes" )
+            let seenRecords' =
+                  if isNothing $ recInduction defn
+                  then seenRecords
+                  else Set.insert qname seenRecords
+                -- Mark all the arguments as implicit
+                recordArgs = map (setHiding Hidden) (argsFromElims elims)
+            reportDoc "mimer.temp" 10 $ "Record args:" <+> pretty (map (\arg -> (pretty $ unArg arg, argInfoHiding $ argInfo arg)) recordArgs)
+            cost <- asks (costProj . searchCosts)
+            fields <- getRecordFields qname
+            comps <- mapM (applyProj recordArgs comp' cost) fields
+            compWGens <- mapM (go seenRecords') comps
+            -- Add the projection name to generators
+            let finishedComps =
+                   concat (zipWith (\cgs f -> map (\(c,g) -> (c,f:g)) cgs) compWGens fields)
+            return $ finishedComps
+
+      _ -> do
+        reportDoc "mimer.temp" 10 $ "Non-record type:" <+> pretty (compType comp')
+        return []
+    return $ (comp', []) : projComps
+    where
+      applyProj :: Args -> Component -> Cost -> QName -> SM Component
+      applyProj recordArgs comp' cost qname = do
+        -- Add meta-variables for the record parameters
+        projNoArgs <- qnameToComponent cost qname
+        let projTerm = apply (compTerm projNoArgs) recordArgs
+        projType <- piApplyM (compType projNoArgs) recordArgs
+        let dom = case unEl $ projType of Pi dom _ -> dom; _ -> __IMPOSSIBLE__
+            arg = setOrigin Inserted $ compTerm comp' <$ argFromDom dom
+            newTerm = apply projTerm [arg]
+        newType <- piApplyM projType (compTerm comp')
+
+        reportSDoc "mimer.temp" 10 $ do
+          ter <- instantiateFull newTerm >>= prettyTCM
+          typ <- instantiateFull newType >>= prettyTCM
+          return $ "After projection:" <+> ter <+> typ
+        newComponentQ (compMetas comp') (compCost comp' + cost) qname newTerm newType
+
+
+applyToMetasG
+  :: Nat -- ^ Arguments to skip applying term. Used for record parameters.
+  -> Maybe Nat -- ^ Max number of arguments to apply.
+  -> Component -> SM Component
+applyToMetasG _ (Just m) comp | m <= 0 = return comp
+applyToMetasG skip maxArgs comp = do
+  ctx <- getContextTelescope
+  case unEl (compType comp) of
+    Pi dom abs -> do
+      let domainType = unDom dom
+      (metaId, metaTerm) <- createMeta domainType
+      let arg = setOrigin Inserted $ metaTerm <$ argFromDom dom
+      newType <- reduce =<< piApplyM (compType comp) metaTerm
+      -- For records, the parameters are not included in the term
+      let newTerm = if skip > 0 then compTerm comp else apply (compTerm comp) [arg]
+      cost <- asks (costNewMeta . searchCosts)
+      applyToMetasG (predNat skip) (predNat <$> maxArgs)
+                    comp{ compTerm = newTerm
+                        , compType = newType
+                        , compMetas = metaId : compMetas comp
+                        , compCost = cost + compCost comp
+                        }
+    _ -> return comp
+
+createMeta :: Type -> SM (MetaId, Term)
+createMeta typ = do
+  (metaId, metaTerm) <- newValueMeta DontRunMetaOccursCheck CmpLeq typ
+  verboseS "mimer.stats" 20 $ updateStat incMetasCreated
+  reportSDoc "mimer.components" 80 $ do
+    metaType <- getMetaTypeInContext metaId
+    return $ "Created meta-variable (type in context):" <+> pretty metaTerm <+> ":" <+> pretty metaType
+  return (metaId, metaTerm)
+
 
 partitionStepResult :: [SearchStepResult] -> ([SearchBranch], [Expr])
 partitionStepResult [] = ([],[])
@@ -789,25 +962,37 @@ refine branch = withBranchState branch $ do
         reportSDoc "mimer.refine" 30 $ ("Abstracted with absurd lambda. Result: " <+>) <$> prettyTCM expr
         return [ResultExpr expr]
       -- Normal abstraction
-      Right (goal', goalType', branch'') ->
-        withBranchAndGoal branch'' goal' $ do
+      Right (goal', goalType', branch'') -> do
+        (branch''', components) <- prepareComponents goal' branch''
+        withBranchAndGoal branch''' goal' $ do
+          reportSMDoc "mimer.temp" 10 $ do
+            subst <- checkpointSubstitution =<< asks searchTopCheckpoint
+            return $ "Substitution after abstraction:" <+> pretty subst
+
           reportSDoc "mimer.refine" 40 $ getContextTelescope >>= \tel -> return $
             "After lambda abstract:" <+> nest 2 (vcat
-                                                 [ "Goal:" <+> pretty goal'
-                                                 , "Goal type:" <+> pretty goalType'
-                                                 , "Goal context:" <+> pretty tel])
+                                                [ "Goal:" <+> pretty goal'
+                                                , "Goal type:" <+> pretty goalType'
+                                                , "Goal context:" <+> pretty tel])
 
+          reportSDoc "mimer.components" 20 $ do
+            comps <- mapM prettyTCM components
+            return $ "Components:" $+$ nest 2 (vcat comps)
+
+  -- TODO: Fix costs!
+          results1 <- mapM checkSolved =<< catMaybes <$> mapM (tryRefineWith (const 0) goal' goalType' branch''') components
+          return results1
           -- We reduce the meta type to WHNF(?) immediately to avoid refining it
           -- multiple times later (required e.g. to check if it is a Pi type)
-          results1 <- tryLocals     goal' goalType' branch''
-          results2 <- tryDataRecord goal' goalType' branch''
-          results3 <- tryLet        goal' goalType' branch''
-          results4 <- tryProjs      goal' goalType' branch''
-          results5 <- tryRecCall    goal' goalType' branch''
-          results6 <- tryFns        goal' goalType' branch''
-          results7 <- tryAxioms     goal' goalType' branch''
-          let results = results1 ++ results2 ++ results3 ++ results4 ++ results5 ++ results6 ++ results7
-          return results
+          -- results1 <- tryLocals     goal' goalType' branch''
+          -- results2 <- tryDataRecord goal' goalType' branch''
+          -- results3 <- tryLet        goal' goalType' branch''
+          -- results4 <- tryProjs      goal' goalType' branch''
+          -- results5 <- tryRecCall    goal' goalType' branch''
+          -- results6 <- tryFns        goal' goalType' branch''
+          -- results7 <- tryAxioms     goal' goalType' branch''
+          -- let results = results1 ++ results2 ++ results3 ++ results4 ++ results5 ++ results6 ++ results7
+          -- return results
 
 tryFns :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
 tryFns goal goalType branch = withBranchAndGoal branch goal $ do
@@ -890,11 +1075,6 @@ tryLocals goal goalType branch = withBranchAndGoal branch goal $ do
   newBranches <- catMaybes <$> mapM (tryRefineAddMetas costLocal goal goalType branch) localVars'
   mapM checkSolved newBranches
 
--- NEXT:
--- 1. Test suite
--- 2. Lenses
--- 3. Caching
-
 tryRecCall :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
 tryRecCall goal goalType branch = asks (hintThisFn . searchComponents) >>= \case
   Nothing -> return []
@@ -914,7 +1094,7 @@ tryRecCall goal goalType branch = asks (hintThisFn . searchComponents) >>= \case
         -- Apply the recursive call to new metas
         (thisFnTerm', thisFnType, newMetas) <- applyToMetas 0 (compTerm thisFn) (compType thisFn)
         -- TODO: Good idea to use noCost here? The actual cost is added later for now.
-        thisFnComp <- newComponent noCost (compName thisFn) thisFnTerm' thisFnType
+        thisFnComp <- newComponent newMetas noCost (compName thisFn) thisFnTerm' thisFnType
         -- Newly created metas must be stored in the branch state
         branch'' <- updateBranch [] branch'
 
@@ -1022,7 +1202,7 @@ tryDataRecord goal goalType branch = withBranchAndGoal branch goal $ do
           cTerm = Con cHead ConOSystem []
       cType <- typeOfConst cName
       cost <- asks (costRecordCon . searchCosts) -- TODO: Use lenses for this?
-      comp <- newComponentQ cost cName cTerm cType
+      comp <- newComponentQ [] cost cName cTerm cType
       -- -- NOTE: at most 1
       newBranches <- maybeToList <$> tryRefineAddMetasSkip costRecordCon (recPars recordDefn) goal goalType branch comp
       mapM checkSolved newBranches
@@ -1030,7 +1210,7 @@ tryDataRecord goal goalType branch = withBranchAndGoal branch goal $ do
     tryData :: Defn -> SM [SearchStepResult]
     tryData dataDefn = do
       cost <- asks (costDataCon . searchCosts)
-      comps <- mapM (constructorToComponent cost) $ dataCons dataDefn
+      comps <- mapM (qnameToComponent cost) $ dataCons dataDefn
       newBranches <- mapM (tryRefineAddMetas costDataCon goal goalType branch) comps
       -- TODO: Reduce overlap between e.g. tryLocals, this and tryRecord
       mapM checkSolved (catMaybes newBranches)
@@ -1048,7 +1228,7 @@ tryDataRecord goal goalType branch = withBranchAndGoal branch goal $ do
         reducedLevel@(Max i [])
           | i > 0 -> do
               cost <- asks (costSet . searchCosts)
-              comp <- newComponent cost Nothing (Sort $ Type $ Max (i-1) []) goalType
+              comp <- newComponent [] cost Nothing (Sort $ Type $ Max (i-1) []) goalType
               return [comp]
           | otherwise -> do
               mlog $ "trySet: don't know what to do with level " ++ prettyShow reducedLevel
@@ -1086,7 +1266,8 @@ tryRefineWith costFn goal goalType branch comp = withBranchAndGoal branch goal $
       mlog $ "  New metas (tryRefineWith): " ++ prettyShow newMetaIds'
 
       reportSMDoc "mimer.refine" 50 $ "Refinement succeeded"
-      Just <$> updateBranchCost costFn comp newMetaIds' branch
+      -- Take the metas stored in the component and add them as sub-goals
+      Just <$> updateBranchCost costFn comp (newMetaIds' ++ compMetas comp) branch
     (False, _) -> do
       reportSMDoc "mimer.refine" 50 $ "Refinement failed"
       return Nothing
@@ -1099,7 +1280,7 @@ tryRefineAddMetasSkip costFn skip goal goalType branch comp = withBranchAndGoal 
   -- TODO: Where is the best pace to reduce the hint type?
   (hintTerm', hintType', newMetas) <- applyToMetas skip (compTerm comp) =<< reduce (compType comp)
   newMetaCost <- asks (costNewMeta . searchCosts)
-  comp' <- newComponent (compCost comp + newMetaCost * length newMetas) (compName comp) hintTerm' hintType'
+  comp' <- newComponent newMetas (compCost comp + newMetaCost * length newMetas) (compName comp) hintTerm' hintType'
   branch' <- updateBranch [] branch
   fmap (addBranchGoals $ map (mkGoalPreserveEnv goal) $ reverse newMetas) <$> tryRefineWith costFn goal goalType branch' comp'
 
@@ -1235,7 +1416,7 @@ getLocalVars cost = do
   contextTypes <- map unDom . flattenTel <$> getContextTelescope
   unless (length contextTerms == length contextTypes)
          (mlog $ "WARNING: length mismatch in getLocalVars: " ++ prettyShow contextTerms ++ "; " ++ prettyShow contextTypes)
-  zipWithM (newComponent cost noName) contextTerms contextTypes
+  zipWithM (newComponent [] cost noName) contextTerms contextTypes
 
 prettyBranch :: SearchBranch -> SM String
 prettyBranch branch = withBranchState branch $ do
@@ -1314,6 +1495,7 @@ instance Pretty Component where
     [ ("compId", pretty $ compId comp)
     , ("compTerm", pretty $ compTerm comp)
     , ("compType", pretty $ compType comp)
+    , ("compMetas", pretty $ compMetas comp)
     , ("compCost", pretty $ compCost comp)
     ]
 
@@ -1339,7 +1521,8 @@ instance PrettyTCM Component where
   prettyTCM comp = do
     term <- prettyTCM $ compTerm comp
     typ <- prettyTCM $ compType comp
-    return $ pretty (compId comp) <> "=" <> term <> ":" <> typ
+    metas <- prettyTCM $ compMetas comp
+    return $ pretty (compId comp) <+> "=" <+> term <+> ":" <+> typ <+> "with meta-variables" <+> metas
 
 
 -- TODO: Not used but keep it around for debug printing
