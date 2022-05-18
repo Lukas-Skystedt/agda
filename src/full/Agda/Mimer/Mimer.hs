@@ -28,7 +28,7 @@ import qualified Text.PrettyPrint.Boxes as Box
 import qualified Agda.Benchmarking as Bench
 import Agda.Syntax.Abstract (Expr(AbsurdLam))
 import Agda.Syntax.Abstract.Name (QName(..), Name(..))
-import Agda.Syntax.Common (InteractionId, MetaId(..), ArgInfo(..), defaultArgInfo, Origin(..), ConOrigin(..), Hiding(..), setOrigin, NameId, Nat, namedThing, Arg(..), setHiding, getHiding)
+import Agda.Syntax.Common (InteractionId, MetaId(..), ArgInfo(..), defaultArgInfo, Origin(..), ConOrigin(..), Hiding(..), setOrigin, NameId, Nat, namedThing, Arg(..), setHiding, getHiding, ProjOrigin(..))
 import Agda.Syntax.Info (exprNoRange)
 import Agda.Syntax.Internal -- (Type, Type''(..), Term(..), Dom'(..), Abs(..), arity , ConHead(..), Sort'(..), Level, argFromDom, Level'(..), absurdBody, Dom, namedClausePats, Pattern'(..), dbPatVarIndex)
 import Agda.Syntax.Internal.MetaVars (AllMetas(..))
@@ -42,10 +42,10 @@ import Agda.TypeChecking.Free (flexRigOccurrenceIn)
 import Agda.TypeChecking.MetaVars (newValueMeta)
 import Agda.TypeChecking.Monad -- (MonadTCM, lookupInteractionId, getConstInfo, liftTCM, clScope, getMetaInfo, lookupMeta, MetaVariable(..), metaType, typeOfConst, getMetaType, MetaInfo(..), getMetaTypeInContext)
 import Agda.TypeChecking.Pretty (MonadPretty, prettyTCM, PrettyTCM(..))
-import Agda.TypeChecking.Records (isRecord)
+import Agda.TypeChecking.Records (isRecord, isRecursiveRecord)
 import Agda.TypeChecking.Reduce (reduce, instantiateFull)
 import Agda.TypeChecking.Rules.Term  (lambdaAddContext)
-import Agda.TypeChecking.Substitute.Class (apply)
+import Agda.TypeChecking.Substitute.Class (apply, applyE)
 import Agda.TypeChecking.Telescope (piApplyM, flattenTel, teleArgs)
 import Agda.Utils.Benchmark (billTo)
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
@@ -135,16 +135,18 @@ instance Ord SearchBranch where
   compare = compare `on` sbCost
 
 -- | List of names of projections used
-type ComponentGen = [QName]
--- data ComponentGen = ComponentDone Component
---                   | NeedsArg Type (Term -> ComponentGen)
---   deriving (Generic)
+data ComponentGen = ComponentGen
+  { cgCompId :: CompId
+  , cgProjs :: [QName]
+  , cgSource :: Component
+  } deriving (Generic)
 
--- instance NFData ComponentGen
+instance NFData ComponentGen
 
 
--- | The @Open ()@ is for keeping track of the context in which the components are valid
-type ComponentCache = (CheckpointId, Map CompId (Maybe Component, ComponentGen))
+-- -- | The @Open ()@ is for keeping track of the context in which the components are valid
+-- type ComponentCache = (CheckpointId, Map CompId (Maybe Component, ComponentGen))
+type ComponentCache = [(Component, [Component])]
 
 data Goal = Goal
   { goalMeta :: MetaId
@@ -565,12 +567,26 @@ collectRecVarCandidates ii = do
       IApplyP{} -> [] -- Only for Cubical?
       DefP{} -> [] -- Only for Cubical?
 
+newComponentGen :: Component -> ComponentGen
+newComponentGen c = ComponentGen {cgCompId = compId c, cgSource = c, cgProjs = []}
+
+addProjToGen :: QName -> CompId -> ComponentGen -> ComponentGen
+addProjToGen proj cId cg = cg{cgCompId = cId, cgProjs = proj : cgProjs cg}
+
 runComponentGen :: ComponentGen -> SM Component
-runComponentGen = undefined
--- runComponentGen (ComponentDone comp) = return comp
--- runComponentGen (NeedsArg typ f) = do
---   let arg = undefined typ
---   runComponentGen (f arg)
+runComponentGen gen = do
+  reportDoc "mimer.components" 60 $ "Running component generator: " <+> pretty gen
+  let comp = cgSource gen
+  comp' <- applyToMetasG 0 Nothing comp
+  go (reverse $ cgProjs gen) comp'
+  where
+  go [] comp = return comp
+  go (projName:prjs) comp = do
+    reportDoc "mimer.components" 80 $ "Applying projection " <+> pretty projName <+> "to" <+> pretty comp
+    (recordName, args, _fields, _isRecursive) <- fromMaybe __IMPOSSIBLE__ <$> getRecordInfo (compType comp)
+    comp' <- applyProj args comp projName
+    comp'' <- applyToMetasG 0 Nothing comp'
+    go prjs comp''
 
 
 ------------------------------------------------------------------------------
@@ -756,6 +772,17 @@ runSearch options stopAfterFirst ii = withInteractionId ii $ do
         reportSMDoc "mimer.stats" 10 $ (q :: SM Doc)
         return solStrs
 
+tryComponents :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
+tryComponents goal goalType branch = withBranchAndGoal branch goal $ do
+
+
+prepareComponents' :: ComponentCache -> SM [(Component, [Component])]
+prepareComponents' = mapM prepare
+  where
+  prepare :: (Component, Maybe [Component]) -> SM [(Component, [Component])]
+  prepare (sourceComp, Just comps) = return (sourceComp, comps)
+  prepare (sourceComp, Nothing) = (sourceComp,) <$> genComponentsFrom sourceComp
+
 prepareComponents :: Goal -> SearchBranch -> SM (SearchBranch, [Component])
 prepareComponents goal branch = withBranchAndGoal branch goal $ do
   cxtTel <- getContextTelescope
@@ -781,14 +808,19 @@ prepareComponents goal branch = withBranchAndGoal branch goal $ do
         unless (subst == IdS) $ reportDoc "mimer.sanity" 10 $
           "WARNING! Substitution should be identity, but was " <+> pretty subst
           <+> "when accessing cache for context" <+> pretty cxtTel
-      -- TODO:
-      -- Traverse the map, regenerating components as needed
-
-      components <- mapM (\case
-                             (Nothing, gen) -> runComponentGen gen
-                             (Just comp, _) -> return comp) (Map.elems cache)
+      -- Look through the cache and re-generate components as necessary
+      (cache', components) <- foldM (\(cache', comps) -> \case
+                             (Nothing, gen) -> do
+                               updateStat incCompRegen
+                               comp <- runComponentGen gen
+                               reportDoc "mimer.components" 50 $ "Regenerated component:" <+> pretty comp
+                               return (Map.insert (compId comp) (Just comp, gen) cache', comp:comps)
+                             (Just comp, _) -> do
+                               updateStat incCompNoRegen
+                               return (cache', comp: comps)) (cache,[]) (Map.elems cache)
+      let newSbCache = Map.insert cxtTel (checkpoint, cache') (sbCache branch)
       -- Update the branch because state has new meta-variables
-      branch' <- updateBranch [] branch
+      branch' <- updateBranch [] branch{sbCache=newSbCache}
       return (branch', components)
 
 
@@ -796,68 +828,74 @@ genComponents :: SM [(Component, ComponentGen)]
 genComponents = do
   cost <- asks (costLocal . searchCosts)
   localVars <- getLocalVars cost
-  concatMapM (genComponentsFrom True) localVars
+  res <- concatMapM (genComponentsFrom True) localVars
+  reportSMDoc "mimer.temp" 50 $ do
+    lns <- mapM (\(comp, gen) -> do
+             comp' <- runComponentGen gen
+             return $ "Original: " <+> pretty comp $+$ "Generated:" <+> pretty comp'
+             ) res
+    return $ "Components and generators:" $+$ nest 2 (vcat lns)
+  return res
 
 genComponentsFrom :: Bool -- ^ Apply record elimination
                   -> Component
                   -> SM [(Component, ComponentGen)]
 genComponentsFrom False comp = do
-  comp <- applyToMetasG 0 Nothing comp
-  return [(comp,[])]
-genComponentsFrom appRecElims origComp = go Set.empty origComp
+  comp' <- applyToMetasG 0 Nothing comp
+  return [(comp', newComponentGen comp)]
+genComponentsFrom appRecElims origComp = do
+  comp <- applyToMetasG 0 Nothing origComp
+  let gen = newComponentGen origComp
+  if appRecElims
+  then go' Set.empty comp gen
+  else return [(comp, gen)]
   where
-  -- We keep a set of recursive records that we have already "seen" to avoid looping
-  go :: Set QName -> Component -> SM [(Component, ComponentGen)]
-  go seenRecords comp = do
-    comp' <- applyToMetasG 0 Nothing comp
-    projComps <- case unEl (compType comp') of
-      Def qname elims
-        | Set.member qname seenRecords -> do
-            reportDoc "mimer.components" 60 $
-              "Skipping projection because recursive record already seen: " <+> pretty qname
-            return []
-        | otherwise -> isRecord qname >>= \case
-          Nothing -> return [(comp', [])]
-          Just defn -> do
-            -- TODO: Is there a better way to check if a record is recursive? There is a recMutual field
-            reportDoc "mimer.temp" 10 $ "Record recursive?" <+> pretty qname <+> ( if isNothing $ recInduction defn then "no" else "yes" )
-            let seenRecords' =
-                  if isNothing $ recInduction defn
-                  then seenRecords
-                  else Set.insert qname seenRecords
-                -- Mark all the arguments as implicit
-                recordArgs = map (setHiding Hidden) (argsFromElims elims)
-            reportDoc "mimer.temp" 10 $ "Record args:" <+> pretty (map (\arg -> (pretty $ unArg arg, argInfoHiding $ argInfo arg)) recordArgs)
-            cost <- asks (costProj . searchCosts)
-            fields <- getRecordFields qname
-            comps <- mapM (applyProj recordArgs comp' cost) fields
-            compWGens <- mapM (go seenRecords') comps
-            -- Add the projection name to generators
-            let finishedComps =
-                   concat (zipWith (\cgs f -> map (\(c,g) -> (c,f:g)) cgs) compWGens fields)
-            return $ finishedComps
+  go' :: Set QName -> Component -> ComponentGen -> SM [(Component, ComponentGen)]
+  go' seenRecords comp gen = do
+    projComps <- getRecordInfo (compType comp) >>= \case
+      Nothing -> return []
+      Just (recordName, args, fields, isRecursive)
+          | Set.member recordName seenRecords -> do
+              reportDoc "mimer.components" 60 $
+                "Skipping projection because recursive record already seen:" <+> pretty recordName
+              return []
+          | otherwise -> do
+              let seenRecords' = if isRecursive then Set.insert recordName seenRecords else seenRecords
+              comps <- mapM (\f -> do
+                comp' <- applyProj args comp f
+                comp'' <- applyToMetasG 0 Nothing comp'
+                return (comp'', addProjToGen f (compId comp'') gen)) fields
 
-      _ -> do
-        reportDoc "mimer.temp" 10 $ "Non-record type:" <+> pretty (compType comp')
-        return []
-    return $ (comp', []) : projComps
-    where
-      applyProj :: Args -> Component -> Cost -> QName -> SM Component
-      applyProj recordArgs comp' cost qname = do
-        -- Add meta-variables for the record parameters
-        projNoArgs <- qnameToComponent cost qname
-        let projTerm = apply (compTerm projNoArgs) recordArgs
-        projType <- piApplyM (compType projNoArgs) recordArgs
-        let dom = case unEl $ projType of Pi dom _ -> dom; _ -> __IMPOSSIBLE__
-            arg = setOrigin Inserted $ compTerm comp' <$ argFromDom dom
-            newTerm = apply projTerm [arg]
-        newType <- piApplyM projType (compTerm comp')
+              concatMapM (uncurry $ go' seenRecords') comps
+    return $ (comp, gen) : projComps
 
-        reportSDoc "mimer.temp" 10 $ do
-          ter <- instantiateFull newTerm >>= prettyTCM
-          typ <- instantiateFull newType >>= prettyTCM
-          return $ "After projection:" <+> ter <+> typ
-        newComponentQ (compMetas comp') (compCost comp' + cost) qname newTerm newType
+getRecordInfo :: Type
+  -> SM (Maybe ( QName     -- Record name
+               , Args      -- Record parameters converted to (hidden) arguments
+               , [QName]   -- Field names
+               , Bool      -- Is recursive?
+               ))
+getRecordInfo typ = case unEl typ of
+  Def qname elims -> isRecord qname >>= \case
+    Nothing -> return Nothing
+    Just defn -> do
+      fields <- getRecordFields qname
+      return $ Just (qname, argsFromElims elims, fields, recRecursive defn)
+  _ -> return Nothing
+
+applyProj :: Args -> Component -> QName -> SM Component
+applyProj recordArgs comp' qname = do
+  cost <- asks (costProj . searchCosts)
+  let newTerm = applyE (compTerm comp') [Proj ProjSystem qname]
+  reportDoc "mimer.temp" 10 $ "applyProj: newTerm =" <+> pretty newTerm
+  projType <- typeOfConst qname
+  projTypeWithArgs <- piApplyM projType recordArgs
+  newType <- piApplyM projTypeWithArgs (compTerm comp')
+  reportSDoc "mimer.temp" 10 $ do
+    ter <- instantiateFull newTerm >>= prettyTCM
+    typ <- instantiateFull newType >>= prettyTCM
+    return $ "After projection:" <+> ter <+> typ
+  newComponentQ (compMetas comp') (compCost comp' + cost) qname newTerm newType
 
 
 applyToMetasG
@@ -951,7 +989,19 @@ refine branch = withBranchState branch $ do
             comps <- mapM prettyTCM components
             return $ "Components:" $+$ nest 2 (vcat comps)
 
-          results1 <- mapM checkSolved =<< catMaybes <$> mapM (tryRefineWith goal' goalType' branch''') components
+          tel <- getContextTelescope
+          let removeCached comp branch =
+                let (checkpoint, cache) = sbCache branch Map.! tel
+                    gen = snd $ cache Map.! compId comp
+                    cache' = Map.insert (compId comp) (Nothing, gen) cache
+                    newSbCache = Map.insert tel (checkpoint, cache') (sbCache branch)
+                in branch{sbCache = newSbCache}
+              temp = removeCached :: Component -> SearchBranch -> SearchBranch
+
+          results1 <- mapM checkSolved =<< catMaybes <$> mapM (\comp -> do
+                                                                  mBranch <- tryRefineWith goal' goalType' branch''' comp
+                                                                  reportDoc "mimer.temp" 10 $ "Deleting component from cache: " <+> pretty comp
+                                                                  return $ removeCached comp <$> mBranch) components
           results2 <- tryDataRecord goal' goalType' branch'''
           return $ results1 ++ results2
           -- We reduce the meta type to WHNF(?) immediately to avoid refining it
@@ -1434,6 +1484,12 @@ instance Pretty Components where
     where
       f n [] = n <> ": []"
       f n xs = (n <> ":") $+$ nest 2 (pretty xs)
+
+instance Pretty ComponentGen where
+  pretty gen = haskellRecord "ComponentGen"
+    [ ("cgCompId", pretty $ cgCompId gen)
+    , ("cgProjs",  pretty $ cgProjs gen)
+    , ("cgSource", pretty $ cgSource gen)]
 
 instance Pretty SearchOptions where
   pretty opts =
