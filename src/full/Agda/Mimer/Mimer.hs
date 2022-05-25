@@ -9,7 +9,7 @@ import Control.Monad ((>=>), (=<<), unless, foldM, when, zipWithM)
 import Control.Monad.Except (catchError)
 import Control.Monad.Error.Class (MonadError)
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Reader (ReaderT(..), runReaderT, asks)
+import Control.Monad.Reader (ReaderT(..), runReaderT, asks, ask)
 import Data.Function (on)
 import Data.Functor ((<&>))
 import Data.List (sortOn, intersect, transpose, (\\))
@@ -61,7 +61,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import Data.IORef (IORef, writeIORef, readIORef, newIORef, modifyIORef')
 import Agda.Mimer.Debug
 
-newtype MimerResult = MimerResult String
+newtype MimerResult = MimerResult (Maybe String)
 
 mimer :: MonadTCM tcm
   => InteractionId
@@ -88,10 +88,10 @@ mimer ii range argStr = liftTCM $ do
     s <- case sols of
           [] -> do
             reportSLn "mimer.top" 10 "No solution found"
-            return "?"
+            return Nothing
           (sol:_) -> do
             reportSLn "mimer.top" 10 ("Solution: " ++ sol)
-            return sol
+            return (Just sol)
 
     putTC oldState
 
@@ -150,7 +150,7 @@ instance Eq Goal where
 
 -- | Components that are not changed during search. Components that do change
 -- (local variables and let bindings) are stored in each 'SearchBranch'.
-data Components = Components
+data BaseComponents = BaseComponents
   { hintFns :: [Component]
   , hintDataTypes :: [Component]
   , hintRecordTypes :: [Component]
@@ -168,7 +168,7 @@ data Components = Components
   }
   deriving (Generic)
 
-instance NFData Components
+instance NFData BaseComponents
 
 type CompId = Int
 data Component = Component
@@ -197,9 +197,14 @@ instance NFData SearchStepResult
 
 -- NOTE: If you edit this, update the corr
 data SearchOptions = SearchOptions
-  { searchComponents :: Components
+  { searchBaseComponents :: BaseComponents
   , searchHintMode :: HintMode
   , searchTimeout :: MilliSeconds
+  , searchGenProjectionsLocal :: Bool
+  , searchGenProjectionsLet :: Bool
+  , searchGenProjectionsExternal :: Bool
+  , searchGenProjectionsRec :: Bool
+  , searchSpeculateProjections :: Bool
   , searchTopMeta :: MetaId
   , searchTopEnv :: TCEnv
   , searchTopCheckpoint :: CheckpointId
@@ -286,7 +291,7 @@ allOpenMetas t = do
   openMetas <- getOpenMetas
   return $ allMetas (:[]) t `intersect` openMetas
 
-getOpenComponent :: Open Component -> SM Component
+getOpenComponent :: MonadTCM tcm => Open Component -> tcm Component
 getOpenComponent openComp = do
   let comp = openThing openComp
   term <- getOpen $ compTerm <$> openComp
@@ -378,11 +383,11 @@ metaInstantiation metaId = lookupLocalMeta metaId <&> mvInstantiation >>= \case
 collectComponents :: ( MonadTCM tcm, ReadTCState tcm, HasConstInfo tcm, MonadFresh NameId tcm
                      , MonadInteractionPoints tcm, MonadStConcreteNames tcm, PureTCM tcm
                      , MonadError TCErr tcm, MonadFresh CompId tcm)
-  => Options -> Costs -> InteractionId -> Maybe QName -> MetaId -> tcm Components
+  => Options -> Costs -> InteractionId -> Maybe QName -> MetaId -> tcm BaseComponents
 collectComponents opts costs ii mDefName metaId = do
   recVars <- collectRecVarCandidates ii
   letVars <- getLetVars (costLocal costs)
-  let components = Components
+  let components = BaseComponents
         { hintFns = []
         , hintDataTypes = []
         , hintRecordTypes = []
@@ -397,7 +402,7 @@ collectComponents opts costs ii mDefName metaId = do
   metaVar <- lookupLocalMeta metaId
   hintNames <- getEverythingInScope metaVar
   components' <- foldM go components hintNames
-  return Components
+  return BaseComponents
     { hintFns = doSort $ hintFns components'
     , hintDataTypes = doSort $ hintDataTypes components'
     , hintRecordTypes = doSort $ hintRecordTypes components'
@@ -535,7 +540,6 @@ collectRecVarCandidates ii = do
         pCTel <- prettyTCM cTel
         return ("Tel:" $+$ nest 2 (pretty iTel $+$ pITel) $+$ "CTel:" $+$ nest 2 (pretty cTel $+$ pCTel))
       reportSDoc "mimer" 60 $ return $ "Shift:" <+> pretty shift
-      -- makeOpen
 
       -- TODO: Names (we don't use flex)
       let flex = concatMap (go False . namedThing . unArg) naps
@@ -647,6 +651,17 @@ runSearch options stopAfterFirst ii = withInteractionId ii $ do
                      else "λ " ++ (unwords $ map unArg $ drop cxtSize $ instTel inst) ++ " → ")
                     ++ body
           reportSLn "mimer.init" 15 $ "Hack-building already instantiated term: " ++ res
+          expr <- withMetaId metaId $ instantiateFull (MetaV metaId [])
+          str <- prettyTCM expr
+          reportDoc "mimer.init" 15 $ "Term built with withMetaId:" <+> str
+          expr2 <- withInteractionId ii $ instantiateFull (MetaV metaId [])
+          str2 <- prettyTCM expr
+          reportDoc "mimer.init" 15 $ "Term built with withInteractionId:" <+> str2
+          -- expr3 <- withInteractionId ii $ do
+          --   args <- getMetaContextArgs metaVar
+          --   instantiateFull (MetaV metaId (argsToElims args))
+          -- str3 <- prettyTCM expr
+          -- reportDoc "mimer.init" 15 $ "Term built with withInteractionId and getMetaContextArgs:" <+> str3
           return [res]
         _ -> __IMPOSSIBLE__
     _ -> do
@@ -664,9 +679,14 @@ runSearch options stopAfterFirst ii = withInteractionId ii $ do
       statsRef <- liftIO $ newIORef emptyMimerStats
       checkpoint <- viewTC eCurrentCheckpoint
       let searchOptions = SearchOptions
-            { searchComponents = components
+            { searchBaseComponents = components
             , searchHintMode = optHintMode options
             , searchTimeout = optTimeout options
+            , searchGenProjectionsLocal = True
+            , searchGenProjectionsLet = True
+            , searchGenProjectionsExternal = False
+            , searchGenProjectionsRec = True
+            , searchSpeculateProjections = True
             , searchTopMeta = metaId
             , searchTopEnv = env
             , searchTopCheckpoint = checkpoint
@@ -674,12 +694,12 @@ runSearch options stopAfterFirst ii = withInteractionId ii $ do
             , searchStats = statsRef
             }
 
-      reportDoc "mimer.init" 20 ("Using search options:" $+$ nest 2 (pretty searchOptions))
+      reportSDoc "mimer.init" 20 $ do
+        opts <- prettyTCM searchOptions
+        return $ "Using search options:" $+$ nest 2 opts
       reportDoc "mimer.init" 20 ("Initial search branch:" $+$ nest 2 (pretty startBranch))
 
       flip runReaderT searchOptions $ bench [Bench.Deserialization] $ do
-        -- mlog $ "Components: " ++ prettyShow components
-        -- mlog =<< ("startBranch: " ++) <$> prettyBranch startBranch
 
         -- TODO: Check what timing stuff is used in Agda.Utils.Time
         timeout <- secondsToNominalDiffTime . (/1000) . fromIntegral <$> asks searchTimeout
@@ -786,15 +806,20 @@ prepareComponents goal branch = withBranchAndGoal branch goal $ do
 
 genComponents :: SM [(Component, [Component])]
 genComponents = do
-  cost <- asks (costLocal . searchCosts)
-  localVars <- getLocalVars cost
-  localComps <- mapM genAddSource localVars
-
-  recCalls <- genRecCalls
-  recComps <- mapM genAddSource recCalls
-  return $ localComps ++ recComps
+  opts <- ask
+  let comps = searchBaseComponents opts
+  localVars <- getLocalVars (costLocal $ searchCosts opts)
+    >>= genAddSource (searchGenProjectionsLocal opts)
+  recCalls <- genRecCalls >>= genAddSource (searchGenProjectionsRec opts)
+  letVars <- mapM getOpenComponent (hintLetVars comps) 
+    >>= genAddSource (searchGenProjectionsLet opts)
+  fns <- genAddSource (searchGenProjectionsExternal opts) (hintFns comps)
+  axioms <- genAddSource (searchGenProjectionsExternal opts) (hintAxioms comps)
+  whhere <- genAddSource (searchGenProjectionsExternal opts) (hintWhere comps)
+  return $ localVars ++ letVars ++ recCalls ++ fns ++ axioms ++ whhere
   where
-    genAddSource comp = (comp,) <$> genComponentsFrom True comp
+    genAddSource :: Bool -> [Component] -> SM [(Component, [Component])]
+    genAddSource genProj = mapM (\comp -> (comp,) <$> genComponentsFrom genProj comp)
 
 
 genComponentsFrom :: Bool -- ^ Apply record elimination
@@ -944,7 +969,7 @@ refine branch = withBranchState branch $ do
                                                   , "Goal type:" <+> pretty goalType3
                                                   , "Goal context:" <+> pretty tel])
             reportSMDoc "mimer.components" 50 $ do
-              comps <- mapM prettyTCM components
+              comps <- mapM prettyTCM $ concatMap snd components
               return $ "Components:" $+$ nest 2 (vcat $ comps)
 
             results1 <- tryComponents goal3 goalType3 branch4 components
@@ -954,25 +979,25 @@ refine branch = withBranchState branch $ do
 tryFns :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
 tryFns goal goalType branch = withBranchAndGoal branch goal $ do
   reportDoc "mimer.refine.fn" 50 $ "Trying functions"
-  fns <- asks (hintFns . searchComponents)
+  fns <- asks (hintFns . searchBaseComponents)
   newBranches <- catMaybes <$> mapM (tryRefineAddMetas goal goalType branch) fns
   mapM checkSolved newBranches
 
 tryProjs :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
 tryProjs goal goalType branch = withBranchAndGoal branch goal $ do
-  projs <- asks (hintProjections . searchComponents)
+  projs <- asks (hintProjections . searchBaseComponents)
   newBranches <- catMaybes <$> mapM (tryRefineAddMetas goal goalType branch) projs
   mapM checkSolved newBranches
 
 tryAxioms :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
 tryAxioms goal goalType branch = withBranchAndGoal branch goal $ do
-  axioms <- asks (hintAxioms . searchComponents)
+  axioms <- asks (hintAxioms . searchBaseComponents)
   newBranches <- catMaybes <$> mapM (tryRefineAddMetas goal goalType branch) axioms
   mapM checkSolved newBranches
 
 tryLet :: Goal -> Type -> SearchBranch -> SM [SearchStepResult]
 tryLet goal goalType branch = withBranchAndGoal branch goal $ do
-  letVars <- asks (hintLetVars . searchComponents) >>= mapM getOpenComponent
+  letVars <- asks (hintLetVars . searchBaseComponents) >>= mapM getOpenComponent
   mlog $ "Let vars: " ++ prettyShow letVars
   newBranches <- catMaybes <$> mapM (tryRefineAddMetas goal goalType branch) letVars
   mapM checkSolved newBranches
@@ -1024,11 +1049,11 @@ tryLamAbs goal goalType branch =
 
 
 genRecCalls :: SM [Component]
-genRecCalls = asks (hintThisFn . searchComponents) >>= \case
+genRecCalls = asks (hintThisFn . searchBaseComponents) >>= \case
   -- If the hole is, e.g., in a type signature, recursive calls are not possible
   Nothing -> return []
   -- TODO: Make sure there are no pruning problems
-  Just thisFn -> asks (hintRecVars . searchComponents) >>= getOpen >>= \case
+  Just thisFn -> asks (hintRecVars . searchBaseComponents) >>= getOpen >>= \case
     -- No candidate arguments for a recursive call
     [] -> return []
     recCandTerms -> do
@@ -1062,7 +1087,7 @@ genRecCalls = asks (hintThisFn . searchComponents) >>= \case
                 putTC state
                 go thisFn (goal:goals) args
               Just (newMetas1, newMetas2) -> do
-                let newComp = thisFn{compMetas = newMetas1 ++ newMetas2 ++ compMetas thisFn}
+                let newComp = thisFn{compMetas = newMetas1 ++ newMetas2 ++ (compMetas thisFn \\ [goalMeta goal])}
                 (thisFn', goals') <- newRecCall
                 (newComp:) <$> go thisFn' (drop (length goals' - length goals - 1) goals') args
       (thisFn', argGoals) <- newRecCall
@@ -1162,7 +1187,7 @@ tryDataRecord goal goalType branch = withBranchAndGoal branch goal $ do
 
     tryLevel :: SM [SearchStepResult]
     tryLevel = do
-      levelHints <- asks (hintLevel . searchComponents)
+      levelHints <- asks (hintLevel . searchBaseComponents)
       newBranches <- catMaybes <$> mapM (tryRefineAddMetas goal goalType branch) levelHints
       mapM checkSolved newBranches
 
@@ -1181,7 +1206,7 @@ tryDataRecord goal goalType branch = withBranchAndGoal branch goal $ do
         reducedLevel -> do
           mlog $ "trySet: don't know what to do with " ++ prettyShow reducedLevel
           return []
-      components <- asks searchComponents
+      components <- asks searchBaseComponents
       newBranches <- catMaybes <$> mapM (tryRefineAddMetas goal goalType branch)
                       (setTerm ++ concatMap ($ components)
                        [ hintDataTypes
@@ -1400,11 +1425,6 @@ prettyBranch branch = withBranchState branch $ do
     let compUses = pretty $ Map.toList $ sbComponentsUsed branch
     return $ render $ text "Branch{cost: " <> text (show $ sbCost branch) <> ", metas: " <> metas <> text " , instantiation: " <> pretty metaId <> text " = " <> instStr <> text ", used components: " <> compUses <> text "}"
 
--- instance Pretty ComponentCache where
---   pretty cache = keyValueList
---     [ ("ccLocalVars",  pretty $ map fst . snd <$> ccLocalVars cache)
---     , ("ccComponents", pretty $ map (mapSnd fst) . Map.toList . snd <$> ccComponents cache)
---     ]
 
 instance Pretty Goal where
   pretty goal = keyValueList
@@ -1426,10 +1446,41 @@ prettySearchStepResult = \case
   OpenBranch branch -> ("Open branch: " ++) <$> prettyBranch branch
   ResultExpr expr -> ("Result expression: " ++) <$> showTCM expr
 
+instance PrettyTCM BaseComponents where
+  prettyTCM comps = do
+    let thisFn = case hintThisFn comps of
+          Nothing -> "(nothing)"
+          Just comp -> prettyComp comp
+    recVars <- prettyTCM =<< getOpen (hintRecVars comps)
+    content <- sequence
+      [ f "hintFns" (hintFns comps)
+      , f "hintDataTypes" (hintDataTypes comps)
+      , f "hintRecordTypes" (hintRecordTypes comps)
+      , f "hintAxioms" (hintAxioms comps)
+      , f "hintLevel" (hintLevel comps)
+      , f "hintWhere" (hintWhere comps)
+      , f "hintProjections" (hintProjections comps)
+      , return $ "hintThisFn:" <+> thisFn
+      , g (return . prettyOpenComp) "hintLetVars" (hintLetVars comps)
+      , return $ "hintRecVars: Open" <+> pretty (openThing $ hintRecVars comps)
+      ]
+    return $ "Base components:" $+$ nest 2 (vcat content)
+    where
+      prettyComp comp = pretty (compTerm comp) <+> ":" <+> pretty (compType comp)
+      prettyOpenComp openComp = "Open" <+> parens (prettyComp $ openThing openComp)
+      prettyTCMComp comp = do
+        term <- prettyTCM (compTerm comp)
+        typ <- prettyTCM (compType comp)
+        return $ term <+> ":" <+> typ
+      f = g prettyTCMComp
+      g p n [] = return $ n <> ": []"
+      g p n xs = do
+        cmps <- mapM p xs
+        return $ (n <> ":") $+$ nest 2 (vcat cmps)
 
 
 -- TODO: Is it possible to derive the pretty instances?
-instance Pretty Components where
+instance Pretty BaseComponents where
   pretty comps = cat
       [ f "hintFns" (hintFns comps)
       , f "hintDataTypes" (hintDataTypes comps)
@@ -1445,7 +1496,7 @@ instance Pretty Components where
 
 instance Pretty SearchOptions where
   pretty opts =
-    "searchComponents:" $+$ nest 2 (pretty $ searchComponents opts) $+$
+    "searchBaseComponents:" $+$ nest 2 (pretty $ searchBaseComponents opts) $+$
     keyValueList
       [ ("searchHintMode", pretty $ searchHintMode opts)
       , ("searchTimeout", pretty $ searchTimeout opts)
@@ -1454,14 +1505,21 @@ instance Pretty SearchOptions where
       ] $+$
       "searchCosts:" $+$ nest 2 (pretty $ searchCosts opts)
 
--- instance Pretty Goal where
---   pretty goal =
---     text "Goal" <> braces (prettyList_
---       [ text "goalMeta=" <> pretty (goalMeta goal)
---       , text "goalLocalVars=" <> pretty (goalLocalVars goal)
---       , text "goalLetVars=" <> pretty (goalLetVars goal)
---       ])
-
+instance PrettyTCM SearchOptions where
+  prettyTCM opts = do
+    comps <- prettyTCM $ searchBaseComponents opts
+    topMeta <- prettyTCM $ searchTopMeta opts
+    checkpoint <- prettyTCM $ searchTopCheckpoint opts
+    return $ "searchBaseComponents:" $+$ nest 2 comps $+$
+      vcat
+        [ "searchHintMode:" <+> pretty (searchHintMode opts)
+        , "searchTimeout:" <+> pretty (searchTimeout opts)
+        , "searchTopMeta:" <+> topMeta
+        , "searchTopEnv: [...]"
+        , "searchTopCheckpoint:" <+> checkpoint
+        , "searchStats: [...]"
+        ] $+$
+        "searchCosts:" $+$ nest 2 (pretty $ searchCosts opts)
 
 instance Pretty Component where
   pretty comp = haskellRecord "Component"
@@ -1471,7 +1529,6 @@ instance Pretty Component where
     , ("compMetas", pretty $ compMetas comp)
     , ("compCost", pretty $ compCost comp)
     ]
-
 
 instance Pretty Costs where
   pretty costs = align 20 entries
