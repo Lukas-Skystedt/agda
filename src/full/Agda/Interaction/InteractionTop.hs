@@ -686,7 +686,15 @@ interpret (Cmd_autoOne ii rng hint) = do
   -- Save the state to have access to even those interaction ids
   -- that Auto solves (since Auto gives the solution right away).
   st <- getTC
+  startTime <- liftIO $ getCPUTime
   (time , res) <- maybeTimed $ Auto.auto ii rng hint
+  elapsed <- let calc = do stopTime <- liftIO $ getCPUTime; return $ Just $ stopTime - startTime
+             in case autoProgress res of
+                Solutions (_:_) -> calc
+                FunClauses{} -> calc
+                _ -> return Nothing
+  Mimer.writeTime ii elapsed
+  -- TODO: Remove the writeTime thing
   case autoProgress res of
    Solutions sols -> do
     lift $ reportSLn "auto" 10 $ "Auto produced the following solutions " ++ show sols
@@ -707,6 +715,7 @@ interpret (Cmd_autoOne ii rng hint) = do
      Nothing  -> interpret $ Cmd_metas AsIs
      Just msg -> display_info $ Info_Auto msg
    FunClauses cs -> do
+    reportSDoc "temp" 10 $ return ("Auto clauses:" <+> pretty cs)
     case autoMessage res of
      Nothing  -> return ()
      Just msg -> display_info $ Info_Auto msg
@@ -731,10 +740,13 @@ interpret Cmd_autoAll = do
         _ -> return []
     modifyTheInteractionPoints (List.\\ concat solved)
 
-interpret (Cmd_mimer ii range str) = do
+interpret (Cmd_mimer ii rng str) = do
   -- TODO: This way of measuring time does not work
-  (time, Mimer.MimerResult result) <- maybeTimed $ Mimer.mimer ii range str
-  putResponse $ Resp_Mimer ii result
+  (time, Mimer.MimerResult result) <- maybeTimed $ Mimer.mimer ii rng str
+  -- case result of
+  --   Just (_, ns@(_:_)) -> interpret (Cmd_make_case ii rng (unwords ns))
+  --   _ -> return ()
+  putResponse $ Resp_Mimer ii (fst <$> result)
   maybe (return ()) (display_info . Info_Time) time
 
 interpret (Cmd_context norm ii _ _) =

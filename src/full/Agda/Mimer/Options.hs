@@ -14,7 +14,7 @@ import Agda.Utils.Pretty (Pretty, pretty, text)
 
 type MilliSeconds = Int
 
-data HintMode = Unqualified | Module | NoHints
+data HintMode = Unqualified | AllModules | Module | NoHints
   deriving (Eq, Show)
 
 data Options = Options
@@ -62,3 +62,6 @@ readTokens (h        : ws) = H h        : readTokens ws
 
 instance Pretty HintMode where
   pretty = text . show
+
+-- instance Pretty Options where
+--   prettyht 
