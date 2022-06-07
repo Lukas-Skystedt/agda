@@ -742,11 +742,23 @@ interpret Cmd_autoAll = do
 
 interpret (Cmd_mimer ii rng str) = do
   -- TODO: This way of measuring time does not work
-  (time, Mimer.MimerResult result) <- maybeTimed $ Mimer.mimer ii rng str
+  (time, result) <- maybeTimed $ Mimer.mimer ii rng str
+  case result of
+    MimerExpr str -> do
+      putResponse $ Resp_GiveAction ii $ Give_String str
+    MimerClauses f cs -> do
+      let casectxt = Nothing
+      -- TODO: This part is copied from the makecase tactic
+      liftCommandMT (withInteractionId ii) $ do
+        tel <- lift $ lookupSection (qnameModule f) -- don't shadow the names in this telescope
+        unicode <- getsTC $ optUseUnicode . getPragmaOptions
+        pcs      :: [Doc]      <- lift $ inTopContext $ addContext tel $ mapM prettyA cs
+        let pcs' :: [String]    = List.map (extlam_dropName unicode casectxt . decorate) pcs
+        putResponse $ Resp_MakeCase ii (makeCaseVariant casectxt) pcs'
+    MimerNoResult -> display_info $ Info_Auto "No solution found"
   -- case result of
   --   Just (_, ns@(_:_)) -> interpret (Cmd_make_case ii rng (unwords ns))
   --   _ -> return ()
-  putResponse $ Resp_Mimer ii (fst <$> result)
   maybe (return ()) (display_info . Info_Time) time
 
 interpret (Cmd_context norm ii _ _) =
@@ -824,25 +836,7 @@ interpret (Cmd_make_case ii rng s) = do
         ]
       ]
     putResponse $ Resp_MakeCase ii (makeCaseVariant casectxt) pcs'
-  where
-    decorate = renderStyle (style { mode = OneLineMode })
 
-    makeCaseVariant :: CaseContext -> MakeCaseVariant
-    makeCaseVariant Nothing = R.Function
-    makeCaseVariant Just{}  = R.ExtendedLambda
-
-    -- very dirty hack, string manipulation by dropping the function name
-    -- and replacing the last " = " with " -> ". It's important not to replace
-    -- the equal sign in named implicit with an arrow!
-    extlam_dropName :: UnicodeOrAscii -> CaseContext -> String -> String
-    extlam_dropName _ Nothing x = x
-    extlam_dropName glyphMode Just{}  x
-        = unwords $ reverse $ replEquals $ reverse $ drop 1 $ words x
-      where
-        arrow = render $ _arrow $ specialCharactersForGlyphs glyphMode
-        replEquals ("=" : ws) = arrow : ws
-        replEquals (w   : ws) = w : replEquals ws
-        replEquals []         = []
 
 interpret (Cmd_compute cmode ii rng s) = do
   expr <- liftLocalState $ do
@@ -854,6 +848,27 @@ interpret Cmd_show_version = display_info Info_Version
 
 interpret Cmd_abort = return ()
 interpret Cmd_exit  = return ()
+
+
+decorate :: Doc -> String
+decorate = renderStyle (style { mode = OneLineMode })
+
+makeCaseVariant :: CaseContext -> MakeCaseVariant
+makeCaseVariant Nothing = R.Function
+makeCaseVariant Just{}  = R.ExtendedLambda
+
+-- very dirty hack, string manipulation by dropping the function name
+-- and replacing the last " = " with " -> ". It's important not to replace
+-- the equal sign in named implicit with an arrow!
+extlam_dropName :: UnicodeOrAscii -> CaseContext -> String -> String
+extlam_dropName _ Nothing x = x
+extlam_dropName glyphMode Just{}  x
+    = unwords $ reverse $ replEquals $ reverse $ drop 1 $ words x
+  where
+    arrow = render $ _arrow $ specialCharactersForGlyphs glyphMode
+    replEquals ("=" : ws) = arrow : ws
+    replEquals (w   : ws) = w : replEquals ws
+    replEquals []         = []
 
 -- | Solved goals already instantiated internally
 -- The second argument potentially limits it to one specific goal.
@@ -871,6 +886,7 @@ solveInstantiatedGoals norm mii = do
         mi <- getMetaInfo <$> lookupLocalMeta m
         e' <- withMetaInfo mi $ abstractToConcreteCtx TopCtx e
         return (i, e')
+
 
 -- | @cmd_load' file argv unsolvedOk cmd@
 --   loads the module in file @file@,

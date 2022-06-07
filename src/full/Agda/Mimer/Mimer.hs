@@ -27,7 +27,7 @@ import qualified Text.PrettyPrint.Boxes as Box
 
 
 import qualified Agda.Benchmarking as Bench
-import Agda.Interaction.MakeCase (makeCase)
+import Agda.Interaction.MakeCase (makeCase, getClauseZipperForIP, recheckAbstractClause)
 import Agda.Syntax.Abstract (Expr(AbsurdLam))
 import qualified Agda.Syntax.Abstract as A
 import Agda.Syntax.Abstract.Name (QName(..), Name(..))
@@ -35,19 +35,21 @@ import Agda.Syntax.Common (InteractionId(..), MetaId(..), ArgInfo(..), defaultAr
 import Agda.Syntax.Info (exprNoRange)
 import Agda.Syntax.Internal -- (Type, Type''(..), Term(..), Dom'(..), Abs(..), arity , ConHead(..), Sort'(..), Level, argFromDom, Level'(..), absurdBody, Dom, namedClausePats, Pattern'(..), dbPatVarIndex)
 import Agda.Syntax.Internal.MetaVars (AllMetas(..))
+import Agda.Syntax.Internal.Pattern (clausePerm)
 import Agda.Syntax.Position (Range, rangeFile)
 import qualified Agda.Syntax.Scope.Base as Scope
-import Agda.Syntax.Translation.InternalToAbstract (reify)
+import Agda.Syntax.Translation.InternalToAbstract (reify, NamedClause(..))
 import Agda.TypeChecking.Constraints (noConstraints)
 import Agda.TypeChecking.Conversion (equalType)
 import qualified Agda.TypeChecking.Empty as Empty -- (isEmptyType)
-import Agda.TypeChecking.Free (flexRigOccurrenceIn)
+import Agda.TypeChecking.Free (flexRigOccurrenceIn, freeVars)
 import Agda.TypeChecking.Level (levelType)
 import Agda.TypeChecking.MetaVars (newValueMeta)
 import Agda.TypeChecking.Monad -- (MonadTCM, lookupInteractionId, getConstInfo, liftTCM, clScope, getMetaInfo, lookupMeta, MetaVariable(..), metaType, typeOfConst, getMetaType, MetaInfo(..), getMetaTypeInContext)
 import Agda.TypeChecking.Pretty (MonadPretty, prettyTCM, PrettyTCM(..))
 import Agda.TypeChecking.Records (isRecord, isRecursiveRecord)
 import Agda.TypeChecking.Reduce (reduce, instantiateFull, instantiate)
+import Agda.TypeChecking.Rules.LHS.Problem (AsBinding(..))
 import Agda.TypeChecking.Rules.Term  (lambdaAddContext)
 import Agda.TypeChecking.Substitute.Class (apply, applyE)
 import Agda.TypeChecking.Telescope (piApplyM, flattenTel, teleArgs)
@@ -68,7 +70,13 @@ import System.IO.Unsafe (unsafePerformIO)
 import Data.IORef (IORef, writeIORef, readIORef, newIORef, modifyIORef')
 import Agda.Mimer.Debug
 
-newtype MimerResult = MimerResult (Maybe (String, [String]))
+data MimerResult
+  = MimerExpr String -- ^ Returns 'String' rather than 'Expr' because the give action expects a string.
+  | MimerClauses QName [A.Clause]
+  | MimerNoResult
+  deriving (Generic)
+
+instance NFData MimerResult
 
 mimer :: MonadTCM tcm
   => InteractionId
@@ -87,18 +95,20 @@ mimer ii rng argStr = liftTCM $ do
     opts <- parseOptions ii rng argStr
     reportS "mimer.top" 15 ("Mimer options: " ++ show opts)
 
-
     oldState <- getTC
+
     sols <- runSearch opts True ii rng
     putTC oldState
 
-    s <- case sols of
+    sol <- case sols of
           [] -> do
             reportSLn "mimer.top" 10 "No solution found"
-            return Nothing
-          (r@(sol, notInScope):_) -> do
-            reportSLn "mimer.top" 10 ("Solution: " ++ sol)
-            return (Just r)
+            return MimerNoResult
+          (sol:_) -> do
+            reportSDoc "mimer.top" 10 $ do
+              pSol <- prettyTCM sol
+              return $ "Solution:" <+> pSol
+            return sol
 
     putTC oldState
 
@@ -106,7 +116,7 @@ mimer ii rng argStr = liftTCM $ do
     let time = stop - start
     reportDoc "mimer.top" 10 ("Total elapsed time:" <+> pretty time)
     writeTime ii (if null sols then Nothing else Just time)
-    return $ MimerResult $ s
+    return sol
 
 
 -- Order to try things in:
@@ -197,6 +207,7 @@ instance Ord Component where
 
 data SearchStepResult
   = ResultExpr Expr
+  | ResultClauses [A.Clause]
   | OpenBranch SearchBranch
   | NoSolution
   deriving (Generic)
@@ -217,6 +228,7 @@ data SearchOptions = SearchOptions
   , searchTopEnv :: TCEnv
   , searchTopCheckpoint :: CheckpointId
   , searchInteractionId :: InteractionId
+  , searchFnName :: Maybe QName
   , searchCosts :: Costs
   , searchStats :: IORef MimerStats
   }
@@ -728,7 +740,7 @@ allVars = \case
 ------------------------------------------------------------------------------
 
 -- TODO: Integrate stopAfterFirst with Options (maybe optStopAfter Nat?)
-runSearch :: Options -> Bool -> InteractionId -> Range -> TCM [(String, [String])]
+runSearch :: Options -> Bool -> InteractionId -> Range -> TCM [MimerResult]
 runSearch options stopAfterFirst ii rng = withInteractionId ii $ do
   (mTheFunctionQName, whereNames) <- fmap ipClause (lookupInteractionPoint ii) <&> \case
     clause@IPClause{} -> ( Just $ ipcQName clause
@@ -781,19 +793,20 @@ runSearch options stopAfterFirst ii rng = withInteractionId ii $ do
       "To bring into scope:      " <+> pretty bringScope $+$
       "To bring into scope (str):" <+> pretty bringScopeNoBraces
                                              )
-  let exprToStringAndVars expr = do
-        let names = allVars expr
-        namesStr <- mapM (fmap render . prettyTCM) names
-        let notInScope = filter ((`elem` bringScopeNoBraces) . fst) $ zip namesStr names
-        reportDoc "mimer.temp" 20 $ "Used names:" $+$ nest 2 (
-          "Pretty:" <+> pretty names $+$
-          "String:" <+> pretty namesStr $+$
-          "Not in scope (str):" <+> pretty (map fst notInScope) $+$
-          "Not in scope (pretty):" <+> pretty (map snd notInScope)
-          )
-        str <- render <$> prettyTCM expr
-        reportDoc "mimer.search" 40 $ "Used the following names that are not in scope:" <+> pretty notInScope
-        return (str, map (render . pretty . snd) notInScope)
+  -- let exprToStringAndVars :: Expr -> (String, [String])
+  --     exprToStringAndVars expr = do
+  --       let names = allVars expr
+  --       namesStr <- mapM (fmap render . prettyTCM) names
+  --       let notInScope = filter ((`elem` bringScopeNoBraces) . fst) $ zip namesStr names
+  --       reportDoc "mimer.temp" 20 $ "Used names:" $+$ nest 2 (
+  --         "Pretty:" <+> pretty names $+$
+  --         "String:" <+> pretty namesStr $+$
+  --         "Not in scope (str):" <+> pretty (map fst notInScope) $+$
+  --         "Not in scope (pretty):" <+> pretty (map snd notInScope)
+  --         )
+  --       str <- render <$> prettyTCM expr
+  --       reportDoc "mimer.search" 40 $ "Used the following names that are not in scope:" <+> pretty notInScope
+  --       return (str, map (render . pretty . snd) notInScope)
 
   -- Check if there are any meta-variables to be solved
   case metaIds of
@@ -804,9 +817,11 @@ runSearch options stopAfterFirst ii rng = withInteractionId ii $ do
           expr <- withInteractionId ii $ do
             metaArgs <- getMetaContextArgs metaVar
             instantiateFull (apply (MetaV metaId []) metaArgs) >>= reify
-          (str, notInScope) <- exprToStringAndVars expr
+          -- (str, notInScope) <- exprToStringAndVars expr
+          str <- render <$> prettyTCM expr
+          let sol = MimerExpr str
           reportDoc "mimer.init" 10 $ "Goal already solved. Solution:" <+> text str
-          return [(str, notInScope)]
+          return [sol]
         _ -> __IMPOSSIBLE__
     _ -> do
       costs <- ifM (hasVerbosity "randomcosts" 1)
@@ -853,6 +868,7 @@ runSearch options stopAfterFirst ii rng = withInteractionId ii $ do
             , searchTopEnv = env
             , searchTopCheckpoint = checkpoint
             , searchInteractionId = ii
+            , searchFnName = mTheFunctionQName
             , searchCosts = costs
             , searchStats = statsRef
             }
@@ -867,7 +883,7 @@ runSearch options stopAfterFirst ii rng = withInteractionId ii $ do
         -- TODO: Check what timing stuff is used in Agda.Utils.Time
         timeout <- secondsToNominalDiffTime . (/1000) . fromIntegral <$> asks searchTimeout
         startTime <- liftIO $ getCurrentTime
-        let go :: Int -> MinQueue SearchBranch -> SM ([Expr], Int)
+        let go :: Int -> MinQueue SearchBranch -> SM ([MimerResult], Int)
             go n branchQueue = case Q.minView branchQueue of
               Nothing -> do
                 reportSLn "mimer.search" 30 $ "No remaining search branches."
@@ -889,7 +905,7 @@ runSearch options stopAfterFirst ii rng = withInteractionId ii $ do
                 let elapsed = diffUTCTime time startTime
                 if elapsed < timeout
                 then do
-                  (newBranches, sols) <- partitionStepResult <$> refine branch
+                  (newBranches, sols) <- refine branch >>= partitionStepResult
                   let branchQueue'' = foldr Q.insert branchQueue' newBranches
                   reportSLn "mimer.search" 40 $ show (length sols) ++ " solutions found during cycle " ++ show (n + 1)
                   reportSMDoc "mimer.search" 45 $ ("Solutions:" <+>) <$> prettyTCM sols
@@ -913,13 +929,64 @@ runSearch options stopAfterFirst ii rng = withInteractionId ii $ do
                   return ([], n)
         (sols, nrSteps) <- go 0 $ Q.singleton startBranch
         reportSLn "mimer.search" 20 $ "Search ended after " ++ show (nrSteps + 1) ++ " cycles"
-        results <- liftTCM $ mapM exprToStringAndVars sols
-        reportDoc "mimer.search" 15 $ "Solutions found: " <+> pretty (map fst results)
+        -- results <- liftTCM $ mapM exprToStringAndVars sols
+        reportSDoc "mimer.search" 15 $ do
+          solDocs <- mapM prettyTCM sols
+          return $ "Solutions found: " <+> pretty solDocs
         reportSMDoc "mimer.stats" 10 $ do
           ref <- asks searchStats
           stats <- liftIO $ readIORef ref
           return $ "Statistics:" <+> text (show stats)
-        return results
+        return sols
+
+doCaseSplit :: InteractionId -> TCM (Maybe A.Clause)
+doCaseSplit ii = do
+  -- TODO: This first part is pretty much cloned form makeCase in MakeCase.hs
+  -- Get function clause which contains the interaction point.
+  InteractionPoint { ipMeta = mm, ipClause = ipCl} <- lookupInteractionPoint ii
+  case ipCl of
+    IPNoClause -> return Nothing
+    IPClause f clauseNo clTy clWithSub absCl clClos _ -> do
+      (casectxt, (prevClauses0, _clause, follClauses0)) <- getClauseZipperForIP f clauseNo
+
+      -- Instead of using the actual internal clause, we retype check the abstract clause (with
+      -- eMakeCase = True). This disables the forcing translation in the unifier, which allows us to
+      -- split on forced variables.
+      -- (clause, clauseCxt, clauseAsBindings) <-
+      --   enterClosure clClos $ \ _ -> locallyTC eMakeCase (const True) $
+      --     recheckAbstractClause clTy clWithSub absCl
+
+      info <- getConstInfo f
+      case theDef info of
+        fnDef@Function{} -> do
+          let origClause = funClauses fnDef !! clauseNo
+          instClauseBody <- sequence $ instantiateFull <$> (clauseBody origClause)
+          let namedClause = NamedClause f False {- TODO -} origClause{clauseBody = instClauseBody}
+          aClause <- reify namedClause
+          return $ Just aClause
+        _ -> return Nothing
+
+      -- let rhs = A.clauseRHS absCl
+      --     perm = fromMaybe __IMPOSSIBLE__ $ clausePerm clause
+      --     tel  = clauseTel  clause
+      --     ps   = namedClausePats clause
+      --     ell  = clauseEllipsis clause
+
+      -- -- First, get context names of the clause.
+      -- let clauseCxtNames = map (fst . unDom) clauseCxt
+      -- -- Valid names to split on are pattern variables of the clause,
+      -- -- plus as-bindings that refer to a variable.
+      -- let clauseVars = zip clauseCxtNames (map var [0..]) ++
+      --                 map (\(AsB name v _ _) -> (name,v)) clauseAsBindings
+
+      -- let fvs = maybe [] freeVars (clauseBody clause)
+
+      -- -- TODO REMOVE!
+      -- _ <- do
+      --         ctx <- getContextArgs
+      --         t' <- t `piApplyM` permute (takeP (length ctx) $ mvPermutation mv) ctx
+      --         nowSolvingConstraints $ assign DirEq mi ctx (Var 0 []) (AsTermsOf t')
+      -- let conClause = toConcrete aClause
 
 tryComponents :: Goal -> Type -> SearchBranch -> [(Component, [Component])] -> SM [SearchStepResult]
 tryComponents goal goalType branch comps = withBranchAndGoal branch goal $ do
@@ -1076,13 +1143,20 @@ createMeta typ = do
   return (metaId, metaTerm)
 
 
-partitionStepResult :: [SearchStepResult] -> ([SearchBranch], [Expr])
-partitionStepResult [] = ([],[])
-partitionStepResult (x:xs) = case x of
-  NoSolution -> rest
-  OpenBranch br -> (br:brs', exps)
-  ResultExpr exp -> (brs', exp:exps)
-  where rest@(brs',exps) = partitionStepResult xs
+partitionStepResult :: [SearchStepResult] -> SM ([SearchBranch], [MimerResult])
+partitionStepResult [] = return ([],[])
+partitionStepResult (x:xs) = do
+  let rest = partitionStepResult xs
+  (brs',sols) <- rest
+  case x of
+    NoSolution -> rest
+    OpenBranch br -> return (br:brs', sols)
+    ResultExpr exp -> do
+      str <- render <$> prettyTCM exp
+      return $ (brs', MimerExpr str : sols)
+    ResultClauses cls -> do
+      f <- fromMaybe __IMPOSSIBLE__ <$> asks searchFnName
+      return $ (brs', MimerClauses f cls : sols)
 
 
 topInstantiationDoc :: SM Doc
@@ -1496,15 +1570,17 @@ checkSolved branch = do
         -- if isOpenMeta topMetaInst
         -- -- No remaining meta-variables, but
         -- then return NoSolution
-        -- case 
         expr <- reify inst
-        return $ ResultExpr expr
-     -- TODO: is there a reason to update branch state?
+        mAClause <- liftTCM $ doCaseSplit ii -- TODO: REMOVE
+        return $ maybe (ResultExpr expr) (ResultClauses . (:[])) mAClause
       metaIds -> do
         goals' <- mapM mkGoal metaIds
         return $ OpenBranch $ branch{sbGoals = reverse goals'}
-    
 
+setAt :: Int -> a -> [a] -> [a]
+setAt i x xs = case splitAt i xs of
+  (ls, _r:rs) -> ls ++ (x : rs)
+  _ -> error "setAt: index out of bounds"
 
 -- checkSolved :: SearchBranch -> SM SearchStepResult
 -- checkSolved branch = {-# SCC "custom-checkSolved" #-} bench [Bench.Deserialization, Bench.Sort] $ do
@@ -1656,11 +1732,6 @@ instance Pretty SearchBranch where
     , ("sbComponentsUsed", pretty $ sbComponentsUsed branch)
     ]
 
-prettySearchStepResult :: SearchStepResult -> SM String
-prettySearchStepResult = \case
-  NoSolution -> return "No solution"
-  OpenBranch branch -> ("Open branch: " ++) <$> prettyBranch branch
-  ResultExpr expr -> ("Result expression: " ++) <$> showTCM expr
 
 instance PrettyTCM BaseComponents where
   prettyTCM comps = do
@@ -1733,6 +1804,7 @@ instance PrettyTCM SearchOptions where
         , "searchTopEnv: [...]"
         , "searchTopCheckpoint:" <+> checkpoint
         , "searchInteractionId:" <+> pretty (searchInteractionId opts)
+        , "searchFnName:" <+> pretty (searchFnName opts)
         , "searchStats: [...]"
         ] $+$
         "searchCosts:" $+$ nest 2 (pretty $ searchCosts opts)
@@ -1774,7 +1846,12 @@ instance PrettyTCM Component where
     return $ pretty (compId comp) <+> "=" <+> term <+> ":" <+> typ <+> "with meta-variables" <+> metas
 
 
--- TODO: Not used but keep it around for debug printing
+instance PrettyTCM MimerResult where
+  prettyTCM = \case
+    MimerExpr expr -> return $ "MimerExpr" <+> pretty expr
+    MimerClauses f cl -> return $ "MimerClauses" <+> pretty f <+> "[..]" -- TODO: display the clauses
+    MimerNoResult -> return "MimerNoResult"
+
 concatMapM :: Monad m => (a -> m [b]) -> [a] -> m [b]
 concatMapM f = fmap concat . mapM f
 

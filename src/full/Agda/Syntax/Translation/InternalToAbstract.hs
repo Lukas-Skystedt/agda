@@ -888,8 +888,10 @@ removeNameUnlessUserWritten a
 -- | Removes implicit arguments that are not needed, that is, that don't bind
 --   any variables that are actually used and doesn't do pattern matching.
 --   Doesn't strip any arguments that were written explicitly by the user.
-stripImplicits :: MonadReify m => A.Patterns -> A.Patterns -> m A.Patterns
-stripImplicits params ps = do
+stripImplicits :: MonadReify m
+  => [ArgName] -- ^ Variables to always include (occurs on RHS of clause)
+  -> A.Patterns -> A.Patterns -> m A.Patterns
+stripImplicits toKeep params ps = do
   -- if --show-implicit we don't need the names
   ifM showImplicitArguments (return $ map (fmap removeNameUnlessUserWritten) ps) $ do
     reportSDoc "reify.implicit" 100 $ return $ vcat
@@ -931,6 +933,7 @@ stripImplicits params ps = do
             , getOrigin a `notElem` [ UserWritten , CaseSplit ]
             , (getOrigin <$> getNameOf a) /= Just UserWritten
             , varOrDot (namedArg a)
+            , maybe True ((`notElem` toKeep) . rangedThing . woThing) (getNameOf a)
             ]
 
           isUnnamedHidden x = notVisible x && isNothing (getNameOf x) && isNothing (isProjP x)
@@ -1299,8 +1302,31 @@ instance Reify NamedClause where
       , "  toDrop =" <+> pshow toDrop
       , "  cl     =" <+> pretty cl
       ]
+
+    let clBody = clauseBody cl
+        rhsVars = maybe [] freeVars clBody
+    rhsVarNames <- mapM nameOfBV' rhsVars
+    rhsUsedNames <- maybe (return []) (fmap allExprVars . reify) clBody
+    let rhsUsedVars = [i | (i, Just n) <- zip rhsVars rhsVarNames, n `elem` rhsUsedNames]
+
+    reportSDoc "reify.clause" 60 $ return $ "RHS:" <+> pretty clBody
+    reportSDoc "reify.clause" 60 $ return $ "variables occurring on RHS:" <+> pretty rhsVars
+      <+> "variable names:" <+> pretty rhsVarNames
+      <+> parens (maybe "no clause body" (const "there was a clause body") clBody)
+    reportSDoc "reify.clause" 60 $ return $ "names occurring on RHS" <+> pretty rhsUsedNames
+      <+> "variables to mark:" <+> pretty rhsUsedVars
+
+
     let ell = clauseEllipsis cl
-    ps  <- reifyPatterns $ namedClausePats cl
+
+    let clausePats' = markNeededPatternVars rhsUsedVars $ namedClausePats cl
+    ps  <- reifyPatterns $ clausePats'
+    reportSDoc "reify.clause" 60 $ do
+      os <- map getOrigin . snd <$> reifyDisplayFormP f ps []
+      return $ "Pattern origins:" <+> pretty (show os)
+    reportSDoc "reify.clause" 60 $ return $ "ClausePats' =" <+> pretty (show clausePats')
+
+
     lhs <- uncurry (SpineLHS $ empty { lhsEllipsis = ell }) <$> reifyDisplayFormP f ps []
     -- Unless @toDrop@ we have already dropped the module patterns from the clauses
     -- (e.g. for extended lambdas). We still get here with toDrop = True and
@@ -1324,7 +1350,82 @@ instance Reify NamedClause where
         let (params , pats) = splitAt n ps
         in  (params , SpineLHS i f pats)
       stripImps :: MonadReify m => [NamedArg A.Pattern] -> SpineLHS -> m SpineLHS
-      stripImps params (SpineLHS i f ps) =  SpineLHS i f <$> stripImplicits params ps
+      stripImps params (SpineLHS i f ps) =  SpineLHS i f <$> stripImplicits [] params ps
+
+allExprVars :: Expr -> [Name]
+allExprVars = \case
+  A.Var n -> [n]
+  A.Def'{} -> []
+  A.Proj{} -> []
+  A.Con{} -> []
+  A.PatternSyn{} -> []
+  A.Macro{} -> []
+  A.Lit{} -> []
+  A.QuestionMark{} -> []
+  A.Underscore{} -> []
+  A.Dot _exprInfo expr -> allExprVars expr
+  A.App _appInfo expr arg -> let named = unArg arg
+                                 n1 = maybeToList $ rangedThing . woThing <$> nameOf named
+                           in {- n1 ++ -} allExprVars expr ++ allExprVars (namedThing named)
+  A.WithApp _exprInfo expr exprs -> allExprVars expr ++ concatMap allExprVars exprs
+  A.Lam _exprInfo _lamBinding expr -> allExprVars expr
+  A.AbsurdLam{} -> []
+  -- TODO
+  A.ExtendedLam _exprInfo _defInfo _erased _qName _clauses -> []
+  -- TODO: go into telescope
+  A.Pi _exprInfo _telescope1 expr -> allExprVars expr
+  A.Generalized _qnames expr -> allExprVars expr
+  A.Fun _exprInfo arg expr -> allExprVars (unArg arg) ++ allExprVars expr
+  -- TODO: go into the bindings
+  A.Let _exprInfo _letBindings expr -> allExprVars expr
+  A.ETel _telescope -> []
+  -- TODO
+  A.Rec _exprInfo _recordAssigns -> []
+  -- TODO: go into assign
+  A.RecUpdate _exprInfo expr _assigns -> allExprVars expr
+  A.ScopedExpr _scopeInfo expr -> allExprVars expr
+  A.Quote _exprInfo -> []
+  A.QuoteTerm _exprInfo -> []
+  A.Unquote _exprInfo -> []
+  A.DontCare expr -> allExprVars expr
+
+markNeededPatternVars :: [Int] -> I.NAPs -> I.NAPs
+markNeededPatternVars vars = map markArg
+  where
+
+    markArg :: NamedArg DeBruijnPattern -> NamedArg DeBruijnPattern
+    markArg arg = case go $ namedThing $ unArg arg of
+      (True, p') -> setOrigin CaseSplit $ setNamedArg arg p'
+      (False,_) -> arg
+
+    mark p = (True, usePatOrigin PatOSplit p)
+    noMark p = (False, p)
+
+    go :: DeBruijnPattern -> (Bool, DeBruijnPattern)
+    go p = case p of
+      I.VarP pi x
+        |  dbPatVarIndex x `elem` vars -> mark p
+        | otherwise -> noMark p
+      I.DotP{} -> noMark p
+      I.ConP ch cpi args ->
+        let (m, args') = goNamedArgs args
+        in if m then mark $ I.ConP ch cpi args' else noMark p
+      I.LitP{} -> noMark p
+      I.ProjP{} -> noMark p
+      I.IApplyP{} -> noMark p -- TODO: is this right?
+      I.DefP pi qname args ->
+        let (m, args') = goNamedArgs args
+        in if m then mark $ I.DefP pi qname args' else noMark p
+      where
+        goNamedArgs :: [NamedArg DeBruijnPattern] -> (Bool, [NamedArg DeBruijnPattern])
+        goNamedArgs args =
+          let markedArgs = map (\namedArgPat ->
+                                  let (b, p') = go (namedThing $ unArg namedArgPat)
+                                  in if b
+                                     then (True, updateNamedArg (const p') namedArgPat)
+                                     else (False, namedArgPat)) args
+              m = any fst markedArgs
+          in (m, map snd markedArgs)
 
 instance Reify (QNamed System) where
   type ReifiesTo (QNamed System) = [A.Clause]
@@ -1349,7 +1450,7 @@ instance Reify (QNamed System) where
         reify (phi, d b)
 
       ps <- reifyPatterns $ teleNamedArgs tel
-      ps <- stripImplicits [] $ ps ++ [defaultNamedArg ep]
+      ps <- stripImplicits [] [] $ ps ++ [defaultNamedArg ep]
       let
         lhs = SpineLHS empty f ps
         result = A.Clause (spineToLhs lhs) [] rhs A.noWhereDecls False
